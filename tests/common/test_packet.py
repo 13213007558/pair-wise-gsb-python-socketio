@@ -266,6 +266,80 @@ class TestPacket:
         assert pkt.data["a"] == "0123456789-"
         assert pkt.attachment_count == 0
 
+    def test_decode_invalid_packet_type(self):
+        with pytest.raises(ValueError):
+            packet.Packet(encoded_packet='7')
+        with pytest.raises(ValueError):
+            packet.Packet(encoded_packet='9["foo"]')
+        with pytest.raises(ValueError):
+            packet.Packet(encoded_packet=b'51-[]')
+
+    def test_decode_unexpected_attachments(self):
+        with pytest.raises(ValueError):
+            packet.Packet(encoded_packet='21-["foo"]')
+
+    def test_decode_binary_invalid_attachment_reference(self):
+        for num in ['-1', '1', '2', 'true', 'false', '"0"', '0.5', 'null',
+                    '[]', '{}']:
+            pkt = packet.Packet(
+                encoded_packet='51-[{"_placeholder":true,"num":%s}]' % num)
+            with pytest.raises(ValueError):
+                pkt.add_attachment(b'1234')
+
+    def test_decode_binary_duplicate_attachment_reference(self):
+        pkt = packet.Packet(
+            encoded_packet=(
+                '51-[{"_placeholder":true,"num":0},'
+                '{"_placeholder":true,"num":0}]'
+            )
+        )
+        assert pkt.add_attachment(b'1234')
+        assert pkt.data == [b'1234', b'1234']
+
+    def test_decode_binary_empty_attachment(self):
+        pkt = packet.Packet(
+            encoded_packet='51-[{"_placeholder":true,"num":0}]'
+        )
+        assert pkt.add_attachment(b'')
+        assert pkt.data == [b'']
+
+    def test_add_attachment_invalid_type(self):
+        pkt = packet.Packet(
+            encoded_packet='51-[{"_placeholder":true,"num":0}]'
+        )
+        with pytest.raises(ValueError):
+            pkt.add_attachment('2["foo"]')
+
+    def test_validate_event_packet(self):
+        pkt = packet.Packet(encoded_packet='2["foo"]')
+        pkt.validate()
+        pkt = packet.Packet(encoded_packet='2["foo",{"a":"b"},123]')
+        pkt.validate()
+        for ep in ['2', '2{}', '2[1]', '2[[]]', '2[{}]', '2"foo"', '2123']:
+            pkt = packet.Packet(encoded_packet=ep)
+            with pytest.raises(ValueError):
+                pkt.validate()
+
+    def test_validate_ack_packet(self):
+        pkt = packet.Packet(encoded_packet='3["foo"]')
+        pkt.validate()
+        pkt = packet.Packet(encoded_packet='3321[]')
+        pkt.validate()
+        for ep in ['3', '3{}', '3"foo"', '3321{"a":"b"}']:
+            pkt = packet.Packet(encoded_packet=ep)
+            with pytest.raises(ValueError):
+                pkt.validate()
+
+    def test_validate_connect_packet(self):
+        pkt = packet.Packet(encoded_packet='0')
+        pkt.validate()
+        pkt = packet.Packet(encoded_packet='0{"token":"abc"}')
+        pkt.validate()
+        for ep in ['0["foo"]', '0"foo"']:
+            pkt = packet.Packet(encoded_packet=ep)
+            with pytest.raises(ValueError):
+                pkt.validate()
+
     def test_deconstruct_binary(self):
         datas = [b'foo', [b'foo', b'bar'], ['foo', b'bar'], {'foo': b'bar'},
                  {'foo': 'bar', 'baz': b'qux'}, {'foo': [b'bar']}]

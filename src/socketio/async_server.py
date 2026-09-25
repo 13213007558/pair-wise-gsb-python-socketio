@@ -694,8 +694,15 @@ class AsyncServer(base_server.BaseServer):
         """Dispatch Engine.IO messages."""
         if eio_sid in self._binary_packet:
             pkt = self._binary_packet[eio_sid]
-            if pkt.add_attachment(data):
+            try:
+                complete = pkt.add_attachment(data)
+            except ValueError:
+                # the packet is invalid, so it is discarded
                 del self._binary_packet[eio_sid]
+                raise
+            if complete:
+                del self._binary_packet[eio_sid]
+                pkt.validate()
                 if pkt.packet_type == packet.BINARY_EVENT:
                     await self._handle_event(eio_sid, pkt.namespace, pkt.id,
                                              pkt.data)
@@ -704,6 +711,7 @@ class AsyncServer(base_server.BaseServer):
                                            pkt.data)
         else:
             pkt = self.packet_class(encoded_packet=data)
+            pkt.validate()
             if pkt.packet_type == packet.CONNECT:
                 await self._handle_connect(eio_sid, pkt.namespace, pkt.data)
             elif pkt.packet_type == packet.DISCONNECT:
@@ -730,6 +738,8 @@ class AsyncServer(base_server.BaseServer):
         """Handle Engine.IO disconnect event."""
         for n in list(self.manager.get_namespaces()).copy():
             await self._handle_disconnect(eio_sid, n, reason)
+        if eio_sid in self._binary_packet:
+            del self._binary_packet[eio_sid]
         if eio_sid in self.environ:
             del self.environ[eio_sid]
 

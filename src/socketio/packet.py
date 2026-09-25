@@ -72,12 +72,18 @@ class Packet:
         The return value indicates how many binary attachment packets are
         necessary to fully decode the packet.
         """
+        if not isinstance(encoded_packet, (str, int)):
+            raise ValueError('Invalid packet')
         ep = encoded_packet
         try:
             self.packet_type = int(ep[0:1])
         except TypeError:
             self.packet_type = ep
             ep = ''
+        if not isinstance(self.packet_type, int) or \
+                self.packet_type < 0 or \
+                self.packet_type > len(packet_names) - 1:
+            raise ValueError('Invalid packet type')
         self.namespace = None
         self.data = None
         ep = ep[1:]
@@ -88,6 +94,9 @@ class Packet:
                 raise ValueError('too many attachments')
             attachment_count = int(ep[0:dash])
             ep = ep[dash + 1:]
+        if attachment_count > 0 and self.packet_type != BINARY_EVENT and \
+                self.packet_type != BINARY_ACK:
+            raise ValueError('Unexpected attachments in packet')
         if ep and ep[0:1] == '/':
             sep = ep.find(',')
             if sep == -1:
@@ -114,9 +123,35 @@ class Packet:
             self.data = self.json.loads(ep)
         return attachment_count
 
+    def validate(self):
+        """Validate a packet received from the network.
+
+        This method ensures that the data payload of the packet has the
+        structure that is expected for the packet's type, so that malformed
+        packets are never delivered to the application. A `ValueError` is
+        raised if the packet is invalid.
+        """
+        if self.packet_type == EVENT or self.packet_type == BINARY_EVENT:
+            # event packets must have a list of arguments, with the event
+            # name as the first element
+            if not isinstance(self.data, list) or len(self.data) == 0 or \
+                    not isinstance(self.data[0], str):
+                raise ValueError('Invalid event packet')
+        elif self.packet_type == ACK or self.packet_type == BINARY_ACK:
+            # ack packets must have a list of arguments
+            if not isinstance(self.data, list):
+                raise ValueError('Invalid ack packet')
+        elif self.packet_type == CONNECT:
+            # connect packets can have an optional dict with authentication
+            # data
+            if self.data is not None and not isinstance(self.data, dict):
+                raise ValueError('Invalid connect packet')
+
     def add_attachment(self, attachment):
         if self.attachment_count <= len(self.attachments):
             raise ValueError('Unexpected binary attachment')
+        if not isinstance(attachment, (bytes, bytearray)):
+            raise ValueError('Invalid binary attachment')
         self.attachments.append(attachment)
         if self.attachment_count == len(self.attachments):
             self.data = self.reconstruct_binary(self.data, self.attachments)
@@ -137,7 +172,11 @@ class Packet:
                     for item in data]
         elif isinstance(data, dict):
             if data.get('_placeholder') and 'num' in data:
-                return attachments[data['num']]
+                num = data['num']
+                if isinstance(num, bool) or not isinstance(num, int) or \
+                        num < 0 or num >= len(attachments):
+                    raise ValueError('Invalid binary attachment reference')
+                return attachments[num]
             else:
                 return {key: cls._reconstruct_binary_internal(value,
                                                               attachments)

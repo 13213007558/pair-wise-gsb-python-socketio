@@ -517,14 +517,22 @@ class Client(base_client.BaseClient):
         """Dispatch Engine.IO messages."""
         if self._binary_packet:
             pkt = self._binary_packet
-            if pkt.add_attachment(data):
+            try:
+                complete = pkt.add_attachment(data)
+            except ValueError:
+                # the packet is invalid, so it is discarded
                 self._binary_packet = None
+                raise
+            if complete:
+                self._binary_packet = None
+                pkt.validate()
                 if pkt.packet_type == packet.BINARY_EVENT:
                     self._handle_event(pkt.namespace, pkt.id, pkt.data)
                 else:
                     self._handle_ack(pkt.namespace, pkt.id, pkt.data)
         else:
             pkt = self.packet_class(encoded_packet=data)
+            pkt.validate()
             if pkt.packet_type == packet.CONNECT:
                 self._handle_connect(pkt.namespace, pkt.data)
             elif pkt.packet_type == packet.DISCONNECT:

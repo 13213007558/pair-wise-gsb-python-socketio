@@ -1311,22 +1311,51 @@ class TestClient:
         c._handle_error.assert_called_with('/foo', None)
         c._handle_eio_message('4/foo,["foo","bar"]')
         c._handle_error.assert_called_with('/foo', ['foo', 'bar'])
-        c._handle_eio_message('51-{"_placeholder":true,"num":0}')
+        c._handle_eio_message('51-["foo",{"_placeholder":true,"num":0}]')
         assert c._binary_packet.packet_type == packet.BINARY_EVENT
         c._handle_eio_message(b'foo')
-        c._handle_event.assert_called_with(None, None, b'foo')
+        c._handle_event.assert_called_with(None, None, ['foo', b'foo'])
         c._handle_eio_message(
-            '62-/foo,{"1":{"_placeholder":true,"num":1},'
-            '"2":{"_placeholder":true,"num":0}}'
+            '62-/foo,[{"_placeholder":true,"num":1},'
+            '{"_placeholder":true,"num":0}]'
         )
         assert c._binary_packet.packet_type == packet.BINARY_ACK
         c._handle_eio_message(b'bar')
         c._handle_eio_message(b'foo')
-        c._handle_ack.assert_called_with(
-            '/foo', None, {'1': b'foo', '2': b'bar'}
-        )
+        c._handle_ack.assert_called_with('/foo', None, [b'foo', b'bar'])
         with pytest.raises(ValueError):
             c._handle_eio_message('9')
+
+    def test_handle_eio_message_binary_invalid_placeholder(self):
+        c = client.Client()
+        c._handle_event = mock.MagicMock()
+        c._handle_eio_message('51-["foo",{"_placeholder":true,"num":-1}]')
+        with pytest.raises(ValueError):
+            c._handle_eio_message(b'foo')
+        c._handle_event.assert_not_called()
+        assert c._binary_packet is None
+
+    def test_handle_eio_message_binary_interrupted(self):
+        c = client.Client()
+        c._handle_event = mock.MagicMock()
+        c._handle_eio_message(
+            '52-["foo",{"_placeholder":true,"num":0},'
+            '{"_placeholder":true,"num":1}]'
+        )
+        # a new packet arrives before all the attachments are received
+        with pytest.raises(ValueError):
+            c._handle_eio_message('2["bar"]')
+        c._handle_event.assert_not_called()
+        assert c._binary_packet is None
+
+    def test_handle_eio_message_invalid_event(self):
+        c = client.Client()
+        c._handle_event = mock.MagicMock()
+        with pytest.raises(ValueError):
+            c._handle_eio_message('2{"a":"b"}')
+        with pytest.raises(ValueError):
+            c._handle_eio_message('2[123]')
+        c._handle_event.assert_not_called()
 
     def test_eio_disconnect(self):
         c = client.Client()

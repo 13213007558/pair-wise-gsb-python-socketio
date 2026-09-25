@@ -1168,22 +1168,51 @@ class TestAsyncClient:
         c._handle_error.assert_awaited_with('/foo', None)
         await c._handle_eio_message('4/foo,["foo","bar"]')
         c._handle_error.assert_awaited_with('/foo', ['foo', 'bar'])
-        await c._handle_eio_message('51-{"_placeholder":true,"num":0}')
+        await c._handle_eio_message('51-["foo",{"_placeholder":true,"num":0}]')
         assert c._binary_packet.packet_type == packet.BINARY_EVENT
         await c._handle_eio_message(b'foo')
-        c._handle_event.assert_awaited_with(None, None, b'foo')
+        c._handle_event.assert_awaited_with(None, None, ['foo', b'foo'])
         await c._handle_eio_message(
-            '62-/foo,{"1":{"_placeholder":true,"num":1},'
-            '"2":{"_placeholder":true,"num":0}}'
+            '62-/foo,[{"_placeholder":true,"num":1},'
+            '{"_placeholder":true,"num":0}]'
         )
         assert c._binary_packet.packet_type == packet.BINARY_ACK
         await c._handle_eio_message(b'bar')
         await c._handle_eio_message(b'foo')
-        c._handle_ack.assert_awaited_with(
-            '/foo', None, {'1': b'foo', '2': b'bar'}
-        )
+        c._handle_ack.assert_awaited_with('/foo', None, [b'foo', b'bar'])
         with pytest.raises(ValueError):
             await c._handle_eio_message('9')
+
+    async def test_handle_eio_message_binary_invalid_placeholder(self):
+        c = async_client.AsyncClient()
+        c._handle_event = mock.AsyncMock()
+        await c._handle_eio_message('51-["foo",{"_placeholder":true,"num":-1}]')
+        with pytest.raises(ValueError):
+            await c._handle_eio_message(b'foo')
+        c._handle_event.assert_not_awaited()
+        assert c._binary_packet is None
+
+    async def test_handle_eio_message_binary_interrupted(self):
+        c = async_client.AsyncClient()
+        c._handle_event = mock.AsyncMock()
+        await c._handle_eio_message(
+            '52-["foo",{"_placeholder":true,"num":0},'
+            '{"_placeholder":true,"num":1}]'
+        )
+        # a new packet arrives before all the attachments are received
+        with pytest.raises(ValueError):
+            await c._handle_eio_message('2["bar"]')
+        c._handle_event.assert_not_awaited()
+        assert c._binary_packet is None
+
+    async def test_handle_eio_message_invalid_event(self):
+        c = async_client.AsyncClient()
+        c._handle_event = mock.AsyncMock()
+        with pytest.raises(ValueError):
+            await c._handle_eio_message('2{"a":"b"}')
+        with pytest.raises(ValueError):
+            await c._handle_eio_message('2[123]')
+        c._handle_event.assert_not_awaited()
 
     async def test_eio_disconnect(self):
         c = async_client.AsyncClient()
