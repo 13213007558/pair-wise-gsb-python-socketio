@@ -123,6 +123,23 @@ class Packet:
             return True
         return False
 
+    def validate(self):
+        """Validate the packet's data payload.
+
+        This method raises a ``ValueError`` exception if the data payload of
+        the packet does not have the correct format for the packet type.
+        """
+        if self.packet_type == EVENT or self.packet_type == BINARY_EVENT:
+            if not isinstance(self.data, list) or len(self.data) == 0 or \
+                    not isinstance(self.data[0], str):
+                raise ValueError('Invalid event packet')
+        elif self.packet_type == ACK or self.packet_type == BINARY_ACK:
+            if not isinstance(self.data, list):
+                raise ValueError('Invalid ack packet')
+        elif self.packet_type == CONNECT:
+            if self.data is not None and not isinstance(self.data, dict):
+                raise ValueError('Invalid connect packet')
+
     @classmethod
     def reconstruct_binary(cls, data, attachments):
         """Reconstruct a decoded packet using the given list of binary
@@ -137,7 +154,11 @@ class Packet:
                     for item in data]
         elif isinstance(data, dict):
             if data.get('_placeholder') and 'num' in data:
-                return attachments[data['num']]
+                num = data['num']
+                if isinstance(num, bool) or not isinstance(num, int) or \
+                        num < 0 or num >= len(attachments):
+                    raise ValueError('Invalid binary attachment placeholder')
+                return attachments[num]
             else:
                 return {key: cls._reconstruct_binary_internal(value,
                                                               attachments)

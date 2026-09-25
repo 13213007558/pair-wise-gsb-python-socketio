@@ -745,6 +745,67 @@ class TestAsyncServer:
                 '{"_placeholder":true,"num":0}]',
             )
 
+    async def test_handle_event_invalid_packets(self, eio):
+        eio.return_value.send = mock.AsyncMock()
+        s = async_server.AsyncServer(async_handlers=False)
+        await s.manager.connect('123', '/')
+        handler = mock.MagicMock()
+        s.on('my message', handler)
+        with pytest.raises(ValueError):
+            await s._handle_eio_message('123', '2')
+        with pytest.raises(ValueError):
+            await s._handle_eio_message('123', '2{"foo":"bar"}')
+        with pytest.raises(ValueError):
+            await s._handle_eio_message('123', '2[]')
+        with pytest.raises(ValueError):
+            await s._handle_eio_message('123', '2[123]')
+        with pytest.raises(ValueError):
+            await s._handle_eio_message('123', '3{"foo":"bar"}')
+        with pytest.raises(ValueError):
+            await s._handle_eio_message('123', '0["foo"]')
+        handler.assert_not_called()
+
+    async def test_handle_event_binary_invalid_attachment(self, eio):
+        eio.return_value.send = mock.AsyncMock()
+        s = async_server.AsyncServer(async_handlers=False)
+        sid = await s.manager.connect('123', '/')
+        handler = mock.MagicMock()
+        s.on('my message', handler)
+        for num in ['-1', '1', 'true', '"0"', '0.5']:
+            await s._handle_eio_message(
+                '123',
+                '51-["my message",{"_placeholder":true,"num":%s}]' % num,
+            )
+            await s._handle_eio_message('123', b'foo')
+            handler.assert_not_called()
+            assert '123' not in s._binary_packet
+        # the connection continues to process new packets normally
+        await s._handle_eio_message('123', '2["my message"]')
+        handler.assert_called_once_with(sid)
+
+    async def test_handle_event_binary_packet_while_waiting(self, eio):
+        eio.return_value.send = mock.AsyncMock()
+        s = async_server.AsyncServer(async_handlers=False)
+        sid = await s.manager.connect('123', '/')
+        handler = mock.MagicMock()
+        s.on('my message', handler)
+        await s._handle_eio_message(
+            '123', '51-["my message",{"_placeholder":true,"num":0}]')
+        assert '123' in s._binary_packet
+        await s._handle_eio_message('123', '2["my message"]')
+        assert '123' not in s._binary_packet
+        handler.assert_called_once_with(sid)
+
+    async def test_handle_eio_disconnect_clears_binary_packet(self, eio):
+        eio.return_value.send = mock.AsyncMock()
+        s = async_server.AsyncServer(async_handlers=False)
+        await s.manager.connect('123', '/')
+        await s._handle_eio_message(
+            '123', '51-["my message",{"_placeholder":true,"num":0}]')
+        assert '123' in s._binary_packet
+        await s._handle_eio_disconnect('123', 'reason')
+        assert '123' not in s._binary_packet
+
     async def test_handle_event_with_ack(self, eio):
         eio.return_value.send = mock.AsyncMock()
         s = async_server.AsyncServer(async_handlers=False)

@@ -1168,22 +1168,73 @@ class TestAsyncClient:
         c._handle_error.assert_awaited_with('/foo', None)
         await c._handle_eio_message('4/foo,["foo","bar"]')
         c._handle_error.assert_awaited_with('/foo', ['foo', 'bar'])
-        await c._handle_eio_message('51-{"_placeholder":true,"num":0}')
+        await c._handle_eio_message('51-["foo",{"_placeholder":true,"num":0}]')
         assert c._binary_packet.packet_type == packet.BINARY_EVENT
         await c._handle_eio_message(b'foo')
-        c._handle_event.assert_awaited_with(None, None, b'foo')
+        c._handle_event.assert_awaited_with(None, None, ['foo', b'foo'])
         await c._handle_eio_message(
-            '62-/foo,{"1":{"_placeholder":true,"num":1},'
-            '"2":{"_placeholder":true,"num":0}}'
+            '62-/foo,[{"1":{"_placeholder":true,"num":1},'
+            '"2":{"_placeholder":true,"num":0}}]'
         )
         assert c._binary_packet.packet_type == packet.BINARY_ACK
         await c._handle_eio_message(b'bar')
         await c._handle_eio_message(b'foo')
         c._handle_ack.assert_awaited_with(
-            '/foo', None, {'1': b'foo', '2': b'bar'}
+            '/foo', None, [{'1': b'foo', '2': b'bar'}]
         )
         with pytest.raises(ValueError):
             await c._handle_eio_message('9')
+
+    async def test_handle_eio_message_invalid_packets(self):
+        c = async_client.AsyncClient()
+        c._handle_connect = mock.AsyncMock()
+        c._handle_event = mock.AsyncMock()
+        c._handle_ack = mock.AsyncMock()
+        with pytest.raises(ValueError):
+            await c._handle_eio_message('2')
+        with pytest.raises(ValueError):
+            await c._handle_eio_message('2{"foo":"bar"}')
+        with pytest.raises(ValueError):
+            await c._handle_eio_message('2[]')
+        with pytest.raises(ValueError):
+            await c._handle_eio_message('2[123]')
+        with pytest.raises(ValueError):
+            await c._handle_eio_message('3{"foo":"bar"}')
+        with pytest.raises(ValueError):
+            await c._handle_eio_message('0["foo"]')
+        c._handle_connect.assert_not_called()
+        c._handle_event.assert_not_called()
+        c._handle_ack.assert_not_called()
+
+    async def test_handle_eio_message_invalid_binary_attachment(self):
+        for num in ['-1', '1', 'true', '"0"', '0.5']:
+            c = async_client.AsyncClient()
+            c._handle_event = mock.AsyncMock()
+            await c._handle_eio_message(
+                '51-["foo",{"_placeholder":true,"num":%s}]' % num)
+            await c._handle_eio_message(b'foo')
+            c._handle_event.assert_not_called()
+            assert c._binary_packet is None
+            # the client continues to process new packets normally
+            await c._handle_eio_message('2["bar"]')
+            c._handle_event.assert_called_with(None, None, ['bar'])
+
+    async def test_handle_eio_message_packet_while_waiting_for_attachment(
+            self):
+        c = async_client.AsyncClient()
+        c._handle_event = mock.AsyncMock()
+        await c._handle_eio_message('51-["foo",{"_placeholder":true,"num":0}]')
+        assert c._binary_packet is not None
+        await c._handle_eio_message('2["bar"]')
+        assert c._binary_packet is None
+        c._handle_event.assert_called_once_with(None, None, ['bar'])
+
+    async def test_handle_eio_disconnect_clears_binary_packet(self):
+        c = async_client.AsyncClient()
+        await c._handle_eio_message('51-["foo",{"_placeholder":true,"num":0}]')
+        assert c._binary_packet is not None
+        await c._handle_eio_disconnect('reason')
+        assert c._binary_packet is None
 
     async def test_eio_disconnect(self):
         c = async_client.AsyncClient()

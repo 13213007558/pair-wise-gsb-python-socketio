@@ -291,3 +291,49 @@ class TestPacket:
         assert pkt.data_is_binary({'a': bytearray(b'foo')})
         assert pkt.data_is_binary({'a': 'foo', 'b': b'bar'})
         assert pkt.data_is_binary({'a': 'foo', 'b': bytearray(b'bar')})
+
+    def test_decode_binary_invalid_placeholder(self):
+        for num in ['-1', '1', 'true', '"0"', '0.5', 'null']:
+            pkt = packet.Packet(
+                encoded_packet=(
+                    '51-["foo",{"_placeholder":true,"num":%s}]' % num
+                )
+            )
+            with pytest.raises(ValueError):
+                pkt.add_attachment(b'foo')
+
+    def test_decode_binary_duplicate_reference(self):
+        pkt = packet.Packet(
+            encoded_packet=(
+                '51-["foo",{"_placeholder":true,"num":0},'
+                '{"_placeholder":true,"num":0}]'
+            )
+        )
+        assert pkt.add_attachment(b'')
+        assert pkt.data == ['foo', b'', b'']
+
+    def test_validate_event(self):
+        packet.Packet(packet_type=packet.EVENT, data=['foo']).validate()
+        with pytest.raises(ValueError):
+            packet.Packet(packet_type=packet.EVENT, data=None).validate()
+        with pytest.raises(ValueError):
+            packet.Packet(packet_type=packet.EVENT, data=[]).validate()
+        with pytest.raises(ValueError):
+            packet.Packet(packet_type=packet.EVENT, data=[123]).validate()
+        with pytest.raises(ValueError):
+            packet.Packet(
+                packet_type=packet.EVENT, data={'a': 1}).validate()
+
+    def test_validate_ack(self):
+        packet.Packet(packet_type=packet.ACK, data=[]).validate()
+        packet.Packet(packet_type=packet.ACK, data=['foo']).validate()
+        with pytest.raises(ValueError):
+            packet.Packet(packet_type=packet.ACK, data=None).validate()
+        with pytest.raises(ValueError):
+            packet.Packet(packet_type=packet.ACK, data='foo').validate()
+
+    def test_validate_connect(self):
+        packet.Packet(packet_type=packet.CONNECT).validate()
+        packet.Packet(packet_type=packet.CONNECT, data={'a': 1}).validate()
+        with pytest.raises(ValueError):
+            packet.Packet(packet_type=packet.CONNECT, data=['a']).validate()

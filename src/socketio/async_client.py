@@ -567,30 +567,44 @@ class AsyncClient(base_client.BaseClient):
     async def _handle_eio_message(self, data):
         """Dispatch Engine.IO messages."""
         if self._binary_packet:
-            pkt = self._binary_packet
-            if pkt.add_attachment(data):
-                self._binary_packet = None
-                if pkt.packet_type == packet.BINARY_EVENT:
-                    await self._handle_event(pkt.namespace, pkt.id, pkt.data)
-                else:
-                    await self._handle_ack(pkt.namespace, pkt.id, pkt.data)
+            if isinstance(data, (bytes, bytearray)):
+                pkt = self._binary_packet
+                try:
+                    complete = pkt.add_attachment(data)
+                except ValueError:
+                    # the attachment is invalid, so the pending packet is
+                    # discarded
+                    self._binary_packet = None
+                    return
+                if complete:
+                    self._binary_packet = None
+                    if pkt.packet_type == packet.BINARY_EVENT:
+                        await self._handle_event(pkt.namespace, pkt.id,
+                                                 pkt.data)
+                    else:
+                        await self._handle_ack(pkt.namespace, pkt.id,
+                                               pkt.data)
+                return
+            # a new packet was received while waiting for binary
+            # attachments, so the incomplete packet is discarded
+            self._binary_packet = None
+        pkt = self.packet_class(encoded_packet=data)
+        pkt.validate()
+        if pkt.packet_type == packet.CONNECT:
+            await self._handle_connect(pkt.namespace, pkt.data)
+        elif pkt.packet_type == packet.DISCONNECT:
+            await self._handle_disconnect(pkt.namespace)
+        elif pkt.packet_type == packet.EVENT:
+            await self._handle_event(pkt.namespace, pkt.id, pkt.data)
+        elif pkt.packet_type == packet.ACK:
+            await self._handle_ack(pkt.namespace, pkt.id, pkt.data)
+        elif pkt.packet_type == packet.BINARY_EVENT or \
+                pkt.packet_type == packet.BINARY_ACK:
+            self._binary_packet = pkt
+        elif pkt.packet_type == packet.CONNECT_ERROR:
+            await self._handle_error(pkt.namespace, pkt.data)
         else:
-            pkt = self.packet_class(encoded_packet=data)
-            if pkt.packet_type == packet.CONNECT:
-                await self._handle_connect(pkt.namespace, pkt.data)
-            elif pkt.packet_type == packet.DISCONNECT:
-                await self._handle_disconnect(pkt.namespace)
-            elif pkt.packet_type == packet.EVENT:
-                await self._handle_event(pkt.namespace, pkt.id, pkt.data)
-            elif pkt.packet_type == packet.ACK:
-                await self._handle_ack(pkt.namespace, pkt.id, pkt.data)
-            elif pkt.packet_type == packet.BINARY_EVENT or \
-                    pkt.packet_type == packet.BINARY_ACK:
-                self._binary_packet = pkt
-            elif pkt.packet_type == packet.CONNECT_ERROR:
-                await self._handle_error(pkt.namespace, pkt.data)
-            else:
-                raise ValueError('Unknown packet type.')
+            raise ValueError('Unknown packet type.')
 
     async def _handle_eio_disconnect(self, reason):
         """Handle the Engine.IO disconnection event."""
