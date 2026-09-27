@@ -1,9 +1,152 @@
 import base64
 from functools import partial
+import threading
 import uuid
 
 from .manager import Manager
 from .packet import Packet
+
+
+class ClusterOperationResult:
+    """Result of a cluster-wide join, leave or disconnect operation.
+
+    :param ok: list of session ids for which the operation was applied.
+    :param stale: list of session ids for which the operation was not applied
+                  because the connection observed at query time is gone. This
+                  happens when the client disconnected or reconnected after
+                  the query that produced the target list was made.
+    :param unknown: list of session ids for which the result of the operation
+                    is unknown, because the host that owns them did not
+                    respond.
+    :param missing_hosts: list of host ids that did not respond to the
+                          operation request.
+    """
+    def __init__(self, ok=None, stale=None, unknown=None, missing_hosts=None):
+        self.ok = ok or []
+        self.stale = stale or []
+        self.unknown = unknown or []
+        self.missing_hosts = missing_hosts or []
+
+    @property
+    def complete(self):
+        """Return ``True`` if all the hosts that were expected to respond did
+        so. When this is ``False``, the ``missing_hosts`` attribute lists the
+        hosts that did not respond, and the ``unknown`` attribute lists the
+        session ids for which the outcome of the operation is not known."""
+        return len(self.missing_hosts) == 0
+
+    def __eq__(self, other):
+        return isinstance(other, ClusterOperationResult) and \
+            self.ok == other.ok and self.stale == other.stale and \
+            self.unknown == other.unknown and \
+            self.missing_hosts == other.missing_hosts
+
+    def __repr__(self):
+        return ('ClusterOperationResult(ok={!r}, stale={!r}, unknown={!r}, '
+                'missing_hosts={!r})').format(
+                    self.ok, self.stale, self.unknown, self.missing_hosts)
+
+
+class ClusterQueryResult:
+    """Result of a cluster-wide participant query.
+
+    This is a point-in-time observation of the clients connected to the
+    cluster, assembled from the responses received from each host. It is not
+    a globally consistent snapshot.
+
+    The ``participants`` attribute is a list of dictionaries, one per client,
+    with the following keys:
+
+    - ``sid``: the session id of the client.
+    - ``namespace``: the namespace the client is connected to.
+    - ``rooms``: the list of rooms the client is in.
+    - ``session``: a dictionary with the session data that was explicitly
+      requested in the query. The request environment and any other session
+      contents are never included unless explicitly requested.
+    - ``host_id``: the id of the host the client is connected to.
+
+    The ``missing_hosts`` attribute lists the ids of the hosts that were
+    expected to respond to the query but did not. A host that does not
+    respond is reported here, and is never assumed to have no connections.
+    """
+    def __init__(self, manager, participants, tokens, missing_hosts):
+        self.participants = participants
+        self.missing_hosts = missing_hosts
+        self._manager = manager
+        self._tokens = tokens
+
+    @property
+    def complete(self):
+        """Return ``True`` if all the hosts that were expected to respond to
+        the query did so. When this is ``False``, the ``missing_hosts``
+        attribute lists the hosts that did not respond, so the participant
+        list may be incomplete."""
+        return len(self.missing_hosts) == 0
+
+    def __len__(self):
+        return len(self.participants)
+
+    def __iter__(self):
+        return iter(self.participants)
+
+    def _targets(self):
+        targets = {}
+        for participant in self.participants:
+            targets.setdefault(participant['host_id'], []).append({
+                'sid': participant['sid'],
+                'namespace': participant['namespace'],
+                'token': self._tokens.get(
+                    (participant['host_id'], participant['sid'])),
+            })
+        return targets
+
+    def join(self, room, timeout=1.0):
+        """Join all the participants in this result to the given room,
+        including participants connected to other hosts.
+
+        :param room: the room to join.
+        :param timeout: how long to wait for the remote hosts to acknowledge
+                        the operation.
+
+        Returns a :class:`ClusterOperationResult` instance. Participants
+        whose connection changed since the query was made are reported as
+        stale and are not affected.
+        """
+        if room is None:
+            raise ValueError('A room is required for this operation')
+        return self._manager._cluster_operation(
+            'join', self._targets(), room=room, timeout=timeout)
+
+    def leave(self, room, timeout=1.0):
+        """Remove all the participants in this result from the given room,
+        including participants connected to other hosts.
+
+        :param room: the room to leave.
+        :param timeout: how long to wait for the remote hosts to acknowledge
+                        the operation.
+
+        Returns a :class:`ClusterOperationResult` instance. Participants
+        whose connection changed since the query was made are reported as
+        stale and are not affected.
+        """
+        if room is None:
+            raise ValueError('A room is required for this operation')
+        return self._manager._cluster_operation(
+            'leave', self._targets(), room=room, timeout=timeout)
+
+    def disconnect(self, timeout=1.0):
+        """Disconnect all the participants in this result, including
+        participants connected to other hosts.
+
+        :param timeout: how long to wait for the remote hosts to acknowledge
+                        the operation.
+
+        Returns a :class:`ClusterOperationResult` instance. Participants
+        whose connection changed since the query was made are reported as
+        stale and are not affected.
+        """
+        return self._manager._cluster_operation(
+            'disconnect', self._targets(), timeout=timeout)
 
 
 class PubSubManager(Manager):
@@ -42,6 +185,8 @@ class PubSubManager(Manager):
         self.write_only = write_only
         self.host_id = uuid.uuid4().hex
         self.logger = logger
+        self._known_hosts = set()
+        self._pending_requests = {}
         if json is not None:
             self.json = json
 
@@ -135,6 +280,172 @@ class PubSubManager(Manager):
         self._handle_close_room(message)  # handle in this host
         self._publish(message)  # notify other hosts
 
+    def get_cluster_participants(self, namespace, room=None,
+                                 session_keys=None, timeout=1.0):
+        """Return the participants of a room across all the servers in the
+        cluster.
+
+        This method sends a query to all the hosts that are known to be part
+        of the cluster and assembles a combined participant list from their
+        responses. The result is a point-in-time observation and not a
+        globally consistent snapshot. Hosts are discovered from previously
+        observed traffic, so a host that has not sent any messages since this
+        server started is not known and cannot be awaited or reported as
+        missing.
+
+        :param namespace: the namespace to query.
+        :param room: the room to query. If omitted, all the clients connected
+                     to the namespace are returned.
+        :param session_keys: an optional list of session keys to include in
+                             the result. Only the given keys are read from
+                             each client's session. The request environment
+                             is never included.
+        :param timeout: how long to wait for the known hosts to respond.
+
+        Returns a :class:`ClusterQueryResult` instance. Hosts that
+        do not respond within the timeout are reported in the result's
+        `missing_hosts` attribute, and are never assumed to have no
+        connections.
+
+        Note: this method requires the manager to be initialized with
+        `write_only` set to `False`, since it needs to
+        receive responses from the other hosts.
+        """
+        namespace = namespace or '/'
+        request_id = uuid.uuid4().hex
+        expected = set(self._known_hosts)
+        pending = {
+            'expected': expected,
+            'responses': {
+                self.host_id: self._local_participants(
+                    namespace, room, session_keys),
+            },
+            'event': threading.Event(),
+        }
+        self._pending_requests[request_id] = pending
+        try:
+            self._publish({
+                'method': 'cluster_query',
+                'request_id': request_id,
+                'namespace': namespace,
+                'room': room,
+                'session_keys': list(session_keys) if session_keys else [],
+                'host_id': self.host_id,
+            })
+            if expected:
+                pending['event'].wait(timeout)
+        finally:
+            self._pending_requests.pop(request_id, None)
+        participants = []
+        tokens = {}
+        for host_id, host_participants in pending['responses'].items():
+            for participant in host_participants:
+                tokens[(host_id, participant['sid'])] = \
+                    participant.get('token')
+                participants.append({
+                    'sid': participant['sid'],
+                    'namespace': participant['namespace'],
+                    'rooms': participant['rooms'],
+                    'session': participant.get('session', {}),
+                    'host_id': host_id,
+                })
+        missing_hosts = sorted(expected - set(pending['responses']))
+        return ClusterQueryResult(self, participants, tokens, missing_hosts)
+
+    def _local_participants(self, namespace, room, session_keys):
+        participants = []
+        for sid, eio_sid in self.get_participants(namespace, room):
+            participant = {
+                'sid': sid,
+                'namespace': namespace,
+                'rooms': self.get_rooms(sid, namespace),
+                'token': eio_sid,
+            }
+            if session_keys:
+                participant['session'] = self._get_session_data(
+                    sid, namespace, session_keys)
+            participants.append(participant)
+        return participants
+
+    def _get_session_data(self, sid, namespace, session_keys):
+        try:
+            session = self.server.get_session(sid, namespace=namespace)
+        except Exception:  # pragma: no cover
+            return {}
+        data = {}
+        for key in session_keys:
+            if key in session:
+                try:
+                    self.json.dumps(session[key])
+                except (TypeError, ValueError):
+                    # do not include values that cannot be serialized, such
+                    # as the raw request environment
+                    continue
+                data[key] = session[key]
+        return data
+
+    def _cluster_operation(self, operation, targets, room=None, timeout=1.0):
+        request_id = uuid.uuid4().hex
+        expected = {host_id for host_id in targets
+                    if host_id != self.host_id}
+        results = {}
+        if self.host_id in targets:
+            results.update(self._apply_cluster_operation(
+                operation, targets[self.host_id], room))
+        pending = {
+            'expected': expected,
+            'responses': {},
+            'event': threading.Event(),
+        }
+        self._pending_requests[request_id] = pending
+        try:
+            if expected:
+                self._publish({
+                    'method': 'cluster_' + operation,
+                    'request_id': request_id,
+                    'targets': {host_id: entries for host_id, entries
+                                in targets.items()
+                                if host_id != self.host_id},
+                    'room': room,
+                    'host_id': self.host_id,
+                })
+                pending['event'].wait(timeout)
+        finally:
+            self._pending_requests.pop(request_id, None)
+        for response in pending['responses'].values():
+            results.update(response)
+        missing_hosts = expected - set(pending['responses'])
+        return ClusterOperationResult(
+            ok=sorted(sid for sid, result in results.items()
+                      if result == 'ok'),
+            stale=sorted(sid for sid, result in results.items()
+                         if result == 'stale'),
+            unknown=sorted({entry['sid'] for host_id in missing_hosts
+                            for entry in targets.get(host_id, [])}),
+            missing_hosts=sorted(missing_hosts))
+
+    def _apply_cluster_operation(self, operation, entries, room):
+        results = {}
+        for entry in entries:
+            sid = entry.get('sid')
+            namespace = entry.get('namespace') or '/'
+            if not self.is_connected(sid, namespace) or \
+                    self.eio_sid_from_sid(sid, namespace) != \
+                    entry.get('token'):
+                # the connection observed at query time is gone, so the
+                # operation is not applied to avoid affecting a different
+                # connection that may have reused the session id
+                results[sid] = 'stale'
+                continue
+            if operation == 'join':
+                super().enter_room(sid, namespace, room)
+            elif operation == 'leave':
+                super().leave_room(sid, namespace, room)
+            else:  # disconnect
+                self.server.disconnect(sid, namespace, ignore_queue=True)
+            results[sid] = 'ok'
+        return results
+
     def _publish(self, data):
         """Publish a message on the Socket.IO channel.
 
@@ -220,6 +531,84 @@ class PubSubManager(Manager):
         super().close_room(room=message.get('room'),
                            namespace=message.get('namespace'))
 
+    def _handle_cluster_query(self, message):
+        self._publish({
+            'method': 'cluster_query_response',
+            'request_id': message.get('request_id'),
+            'host_id': self.host_id,
+            'participants': self._local_participants(
+                message.get('namespace') or '/', message.get('room'),
+                message.get('session_keys')),
+        })
+
+    def _handle_cluster_query_response(self, message):
+        self._record_response(message.get('request_id'),
+                              message.get('host_id'),
+                              message.get('participants') or [])
+
+    def _handle_cluster_operation(self, message):
+        entries = message.get('targets', {}).get(self.host_id)
+        if not entries:
+            # this host has no clients targeted by the operation
+            return
+        operation = message['method'][len('cluster_'):]
+        self._publish({
+            'method': 'cluster_operation_response',
+            'request_id': message.get('request_id'),
+            'host_id': self.host_id,
+            'results': self._apply_cluster_operation(
+                operation, entries, message.get('room')),
+        })
+
+    def _handle_cluster_operation_response(self, message):
+        self._record_response(message.get('request_id'),
+                              message.get('host_id'),
+                              message.get('results') or {})
+
+    def _record_response(self, request_id, host_id, payload):
+        pending = self._pending_requests.get(request_id)
+        if pending is None:
+            # the response arrived after the request completed, so it is
+            # too late to use it
+            return
+        if host_id in pending['responses']:
+            # a duplicate response from a host that already responded
+            return
+        pending['responses'][host_id] = payload
+        if pending['expected'] <= set(pending['responses']):
+            pending['event'].set()
+
+    def _process_message(self, data):
+        host_id = data.get('host_id')
+        if host_id is not None and host_id != self.host_id:
+            self._known_hosts.add(host_id)
+        try:
+            if data['method'] == 'callback':
+                self._handle_callback(data)
+            elif host_id != self.host_id:
+                if data['method'] == 'emit':
+                    self._handle_emit(data)
+                elif data['method'] == 'disconnect':
+                    self._handle_disconnect(data)
+                elif data['method'] == 'enter_room':
+                    self._handle_enter_room(data)
+                elif data['method'] == 'leave_room':
+                    self._handle_leave_room(data)
+                elif data['method'] == 'close_room':
+                    self._handle_close_room(data)
+                elif data['method'] == 'cluster_query':
+                    self._handle_cluster_query(data)
+                elif data['method'] == 'cluster_query_response':
+                    self._handle_cluster_query_response(data)
+                elif data['method'] in ('cluster_join', 'cluster_leave',
+                                        'cluster_disconnect'):
+                    self._handle_cluster_operation(data)
+                elif data['method'] == 'cluster_operation_response':
+                    self._handle_cluster_operation_response(data)
+        except Exception:
+            self.server.logger.exception(
+                'Handler error in pubsub listening thread')
+
     def _thread(self):
         while True:
             try:
@@ -235,23 +624,7 @@ class PubSubManager(Manager):
                     if data and 'method' in data:
                         self._get_logger().debug('pubsub message: {}'.format(
                             data['method']))
-                        try:
-                            if data['method'] == 'callback':
-                                self._handle_callback(data)
-                            elif data.get('host_id') != self.host_id:
-                                if data['method'] == 'emit':
-                                    self._handle_emit(data)
-                                elif data['method'] == 'disconnect':
-                                    self._handle_disconnect(data)
-                                elif data['method'] == 'enter_room':
-                                    self._handle_enter_room(data)
-                                elif data['method'] == 'leave_room':
-                                    self._handle_leave_room(data)
-                                elif data['method'] == 'close_room':
-                                    self._handle_close_room(data)
-                        except Exception:
-                            self.server.logger.exception(
-                                'Handler error in pubsub listening thread')
+                        self._process_message(data)
                 self.server.logger.error('pubsub listen() exited unexpectedly')
                 break  # loop should never exit except in unit tests!
             except Exception:  # pragma: no cover

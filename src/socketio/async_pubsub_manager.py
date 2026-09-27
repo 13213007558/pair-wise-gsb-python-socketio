@@ -5,6 +5,65 @@ import uuid
 
 from .async_manager import AsyncManager
 from .packet import Packet
+from .pubsub_manager import ClusterOperationResult, ClusterQueryResult
+
+
+class AsyncClusterQueryResult(ClusterQueryResult):
+    """Async version of :class:`ClusterQueryResult`, returned by
+    `AsyncPubSubManager.get_cluster_participants`."""
+    async def join(self, room, timeout=1.0):
+        """Join all the participants in this result to the given room,
+        including participants connected to other hosts.
+
+        :param room: the room to join.
+        :param timeout: how long to wait for the remote hosts to acknowledge
+                        the operation.
+
+        Returns a :class:`ClusterOperationResult` instance.
+        Participants whose connection changed since the query was made are
+        reported as stale and are not affected.
+
+        Note: this method is a coroutine.
+        """
+        if room is None:
+            raise ValueError('A room is required for this operation')
+        return await self._manager._cluster_operation(
+            'join', self._targets(), room=room, timeout=timeout)
+
+    async def leave(self, room, timeout=1.0):
+        """Remove all the participants in this result from the given room,
+        including participants connected to other hosts.
+
+        :param room: the room to leave.
+        :param timeout: how long to wait for the remote hosts to acknowledge
+                        the operation.
+
+        Returns a :class:`ClusterOperationResult` instance.
+        Participants whose connection changed since the query was made are
+        reported as stale and are not affected.
+
+        Note: this method is a coroutine.
+        """
+        if room is None:
+            raise ValueError('A room is required for this operation')
+        return await self._manager._cluster_operation(
+            'leave', self._targets(), room=room, timeout=timeout)
+
+    async def disconnect(self, timeout=1.0):
+        """Disconnect all the participants in this result, including
+        participants connected to other hosts.
+
+        :param timeout: how long to wait for the remote hosts to acknowledge
+                        the operation.
+
+        Returns a :class:`ClusterOperationResult` instance.
+        Participants whose connection changed since the query was made are
+        reported as stale and are not affected.
+
+        Note: this method is a coroutine.
+        """
+        return await self._manager._cluster_operation(
+            'disconnect', self._targets(), timeout=timeout)
 
 
 class AsyncPubSubManager(AsyncManager):
@@ -43,6 +102,8 @@ class AsyncPubSubManager(AsyncManager):
         self.write_only = write_only
         self.host_id = uuid.uuid4().hex
         self.logger = logger
+        self._known_hosts = set()
+        self._pending_requests = {}
         if json is not None:
             self.json = json
 
@@ -139,6 +200,181 @@ class AsyncPubSubManager(AsyncManager):
         await self._handle_close_room(message)  # handle in this host
         await self._publish(message)  # notify other hosts
 
+    async def get_cluster_participants(self, namespace, room=None,
+                                       session_keys=None, timeout=1.0):
+        """Return the participants of a room across all the servers in the
+        cluster.
+
+        This method sends a query to all the hosts that are known to be part
+        of the cluster and assembles a combined participant list from their
+        responses. The result is a point-in-time observation and not a
+        globally consistent snapshot. Hosts are discovered from previously
+        observed traffic, so a host that has not sent any messages since this
+        server started is not known and cannot be awaited or reported as
+        missing.
+
+        :param namespace: the namespace to query.
+        :param room: the room to query. If omitted, all the clients connected
+                     to the namespace are returned.
+        :param session_keys: an optional list of session keys to include in
+                             the result. Only the given keys are read from
+                             each client's session. The request environment
+                             is never included.
+        :param timeout: how long to wait for the known hosts to respond.
+
+        Returns an :class:`AsyncClusterQueryResult` instance. Hosts
+        that do not respond within the timeout are reported in the result's
+        `missing_hosts` attribute, and are never assumed to have no
+        connections.
+
+        Note: this method is a coroutine. It requires the manager to be
+        initialized with `write_only` set to `False`,
+        since it needs to receive responses from the other hosts.
+        """
+        namespace = namespace or '/'
+        request_id = uuid.uuid4().hex
+        expected = set(self._known_hosts)
+        pending = {
+            'expected': expected,
+            'responses': {
+                self.host_id: await self._local_participants(
+                    namespace, room, session_keys),
+            },
+            'event': asyncio.Event(),
+        }
+        self._pending_requests[request_id] = pending
+        try:
+            await self._publish({
+                'method': 'cluster_query',
+                'request_id': request_id,
+                'namespace': namespace,
+                'room': room,
+                'session_keys': list(session_keys) if session_keys else [],
+                'host_id': self.host_id,
+            })
+            if expected:
+                try:
+                    await asyncio.wait_for(pending['event'].wait(), timeout)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._pending_requests.pop(request_id, None)
+        participants = []
+        tokens = {}
+        for host_id, host_participants in pending['responses'].items():
+            for participant in host_participants:
+                tokens[(host_id, participant['sid'])] = \
+                    participant.get('token')
+                participants.append({
+                    'sid': participant['sid'],
+                    'namespace': participant['namespace'],
+                    'rooms': participant['rooms'],
+                    'session': participant.get('session', {}),
+                    'host_id': host_id,
+                })
+        missing_hosts = sorted(expected - set(pending['responses']))
+        return AsyncClusterQueryResult(self, participants, tokens,
+                                       missing_hosts)
+
+    async def _local_participants(self, namespace, room, session_keys):
+        participants = []
+        for sid, eio_sid in self.get_participants(namespace, room):
+            participant = {
+                'sid': sid,
+                'namespace': namespace,
+                'rooms': self.get_rooms(sid, namespace),
+                'token': eio_sid,
+            }
+            if session_keys:
+                participant['session'] = await self._get_session_data(
+                    sid, namespace, session_keys)
+            participants.append(participant)
+        return participants
+
+    async def _get_session_data(self, sid, namespace, session_keys):
+        try:
+            session = await self.server.get_session(sid, namespace=namespace)
+        except Exception:  # pragma: no cover
+            return {}
+        data = {}
+        for key in session_keys:
+            if key in session:
+                try:
+                    self.json.dumps(session[key])
+                except (TypeError, ValueError):
+                    # do not include values that cannot be serialized, such
+                    # as the raw request environment
+                    continue
+                data[key] = session[key]
+        return data
+
+    async def _cluster_operation(self, operation, targets, room=None,
+                                 timeout=1.0):
+        request_id = uuid.uuid4().hex
+        expected = {host_id for host_id in targets
+                    if host_id != self.host_id}
+        results = {}
+        if self.host_id in targets:
+            results.update(await self._apply_cluster_operation(
+                operation, targets[self.host_id], room))
+        pending = {
+            'expected': expected,
+            'responses': {},
+            'event': asyncio.Event(),
+        }
+        self._pending_requests[request_id] = pending
+        try:
+            if expected:
+                await self._publish({
+                    'method': 'cluster_' + operation,
+                    'request_id': request_id,
+                    'targets': {host_id: entries for host_id, entries
+                                in targets.items()
+                                if host_id != self.host_id},
+                    'room': room,
+                    'host_id': self.host_id,
+                })
+                try:
+                    await asyncio.wait_for(pending['event'].wait(), timeout)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._pending_requests.pop(request_id, None)
+        for response in pending['responses'].values():
+            results.update(response)
+        missing_hosts = expected - set(pending['responses'])
+        return ClusterOperationResult(
+            ok=sorted(sid for sid, result in results.items()
+                      if result == 'ok'),
+            stale=sorted(sid for sid, result in results.items()
+                         if result == 'stale'),
+            unknown=sorted({entry['sid'] for host_id in missing_hosts
+                            for entry in targets.get(host_id, [])}),
+            missing_hosts=sorted(missing_hosts))
+
+    async def _apply_cluster_operation(self, operation, entries, room):
+        results = {}
+        for entry in entries:
+            sid = entry.get('sid')
+            namespace = entry.get('namespace') or '/'
+            if not self.is_connected(sid, namespace) or \
+                    self.eio_sid_from_sid(sid, namespace) != \
+                    entry.get('token'):
+                # the connection observed at query time is gone, so the
+                # operation is not applied to avoid affecting a different
+                # connection that may have reused the session id
+                results[sid] = 'stale'
+                continue
+            if operation == 'join':
+                await super().enter_room(sid, namespace, room)
+            elif operation == 'leave':
+                await super().leave_room(sid, namespace, room)
+            else:  # disconnect
+                await self.server.disconnect(sid, namespace,
+                                             ignore_queue=True)
+            results[sid] = 'ok'
+        return results
+
     async def _publish(self, data):
         """Publish a message on the Socket.IO channel.
 
@@ -226,6 +462,86 @@ class AsyncPubSubManager(AsyncManager):
         await super().close_room(room=message.get('room'),
                                  namespace=message.get('namespace'))
 
+    async def _handle_cluster_query(self, message):
+        await self._publish({
+            'method': 'cluster_query_response',
+            'request_id': message.get('request_id'),
+            'host_id': self.host_id,
+            'participants': await self._local_participants(
+                message.get('namespace') or '/', message.get('room'),
+                message.get('session_keys')),
+        })
+
+    async def _handle_cluster_query_response(self, message):
+        self._record_response(message.get('request_id'),
+                              message.get('host_id'),
+                              message.get('participants') or [])
+
+    async def _handle_cluster_operation(self, message):
+        entries = message.get('targets', {}).get(self.host_id)
+        if not entries:
+            # this host has no clients targeted by the operation
+            return
+        operation = message['method'][len('cluster_'):]
+        await self._publish({
+            'method': 'cluster_operation_response',
+            'request_id': message.get('request_id'),
+            'host_id': self.host_id,
+            'results': await self._apply_cluster_operation(
+                operation, entries, message.get('room')),
+        })
+
+    async def _handle_cluster_operation_response(self, message):
+        self._record_response(message.get('request_id'),
+                              message.get('host_id'),
+                              message.get('results') or {})
+
+    def _record_response(self, request_id, host_id, payload):
+        pending = self._pending_requests.get(request_id)
+        if pending is None:
+            # the response arrived after the request completed, so it is
+            # too late to use it
+            return
+        if host_id in pending['responses']:
+            # a duplicate response from a host that already responded
+            return
+        pending['responses'][host_id] = payload
+        if pending['expected'] <= set(pending['responses']):
+            pending['event'].set()
+
+    async def _process_message(self, data):
+        host_id = data.get('host_id')
+        if host_id is not None and host_id != self.host_id:
+            self._known_hosts.add(host_id)
+        try:
+            if data['method'] == 'callback':
+                await self._handle_callback(data)
+            elif host_id != self.host_id:
+                if data['method'] == 'emit':
+                    await self._handle_emit(data)
+                elif data['method'] == 'disconnect':
+                    await self._handle_disconnect(data)
+                elif data['method'] == 'enter_room':
+                    await self._handle_enter_room(data)
+                elif data['method'] == 'leave_room':
+                    await self._handle_leave_room(data)
+                elif data['method'] == 'close_room':
+                    await self._handle_close_room(data)
+                elif data['method'] == 'cluster_query':
+                    await self._handle_cluster_query(data)
+                elif data['method'] == 'cluster_query_response':
+                    await self._handle_cluster_query_response(data)
+                elif data['method'] in ('cluster_join', 'cluster_leave',
+                                        'cluster_disconnect'):
+                    await self._handle_cluster_operation(data)
+                elif data['method'] == 'cluster_operation_response':
+                    await self._handle_cluster_operation_response(data)
+        except asyncio.CancelledError:
+            raise  # let the outer try/except handle it
+        except Exception:
+            self.server.logger.exception(
+                'Handler error in pubsub listening thread')
+
     async def _thread(self):
         while True:
             try:
@@ -241,25 +557,7 @@ class AsyncPubSubManager(AsyncManager):
                     if data and 'method' in data:
                         self._get_logger().debug('pubsub message: {}'.format(
                             data['method']))
-                        try:
-                            if data['method'] == 'callback':
-                                await self._handle_callback(data)
-                            elif data.get('host_id') != self.host_id:
-                                if data['method'] == 'emit':
-                                    await self._handle_emit(data)
-                                elif data['method'] == 'disconnect':
-                                    await self._handle_disconnect(data)
-                                elif data['method'] == 'enter_room':
-                                    await self._handle_enter_room(data)
-                                elif data['method'] == 'leave_room':
-                                    await self._handle_leave_room(data)
-                                elif data['method'] == 'close_room':
-                                    await self._handle_close_room(data)
-                        except asyncio.CancelledError:
-                            raise  # let the outer try/except handle it
-                        except Exception:
-                            self.server.logger.exception(
-                                'Handler error in pubsub listening thread')
+                        await self._process_message(data)
                 self.server.logger.error('pubsub listen() exited unexpectedly')
                 break  # loop should never exit except in unit tests!
             except asyncio.CancelledError:  # pragma: no cover

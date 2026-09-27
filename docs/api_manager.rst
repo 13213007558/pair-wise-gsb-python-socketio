@@ -9,6 +9,15 @@ Managers
    :members:
    :inherited-members:
 
+.. autoclass:: socketio.ClusterQueryResult
+   :members:
+
+.. autoclass:: socketio.ClusterOperationResult
+   :members:
+
+.. autoclass:: socketio.AsyncClusterQueryResult
+   :members:
+
 .. autoclass:: socketio.KombuManager
    :members:
    :inherited-members:
@@ -36,4 +45,3 @@ Managers
 .. autoclass:: socketio.AsyncAioPikaManager
    :members:
    :inherited-members:
-

@@ -859,3 +859,290 @@ class TestAsyncPubSubManager:
 
         packet.Packet.json = saved_json
         EIOPacket.json = saved_json
+
+
+class _AsyncClusterBus:
+    """An in-memory pub/sub backend that connects any number of managers."""
+    def __init__(self):
+        self.managers = {}
+        self.blocked = set()
+        self.published = []
+
+    def add(self, manager):
+        self.managers[manager.host_id] = manager
+
+        async def _publish(message, _manager=manager):
+            await self.publish(_manager, message)
+
+        manager._publish = _publish
+
+    async def publish(self, sender, message):
+        # simulate the serialization that a real backend would perform
+        message = json.loads(json.dumps(message))
+        self.published.append((sender.host_id, message))
+        for host_id, manager in self.managers.items():
+            if manager is sender or host_id in self.blocked:
+                continue
+            await manager._process_message(message)
+
+
+class TestAsyncPubSubManagerCluster:
+    def _make_manager(self, bus, host_id, sessions=None):
+        mock_server = mock.MagicMock()
+        mock_server.packet_class = packet.Packet
+        mock_server._send_packet = mock.AsyncMock()
+        mock_server._send_eio_packet = mock.AsyncMock()
+        mock_server.disconnect = mock.AsyncMock()
+        mock_server.get_session = mock.AsyncMock(
+            side_effect=lambda sid, namespace=None: (
+                sessions or {}).get(sid, {}))
+        counter = [0]
+
+        def generate_id():
+            counter[0] += 1
+            return host_id + '-sid-' + str(counter[0])
+
+        mock_server.eio.generate_id = generate_id
+        pm = async_pubsub_manager.AsyncPubSubManager()
+        pm.set_server(mock_server)
+        pm.host_id = host_id
+        pm.initialize()
+        bus.add(pm)
+        return pm
+
+    async def _make_cluster(self, sessions=None):
+        bus = _AsyncClusterBus()
+        managers = [
+            self._make_manager(bus, 'host-a', (sessions or {}).get('host-a')),
+            self._make_manager(bus, 'host-b', (sessions or {}).get('host-b')),
+            self._make_manager(bus, 'host-c', (sessions or {}).get('host-c')),
+        ]
+        sids = {}
+        for pm in managers:
+            sid = await pm.connect('eio-' + pm.host_id, '/')
+            pm.basic_enter_room(sid, '/', 'room1')
+            sids[pm.host_id] = sid
+        # generate some traffic so that the hosts discover each other
+        for pm in managers:
+            await pm.emit('ping', 'x')
+        return bus, managers, sids
+
+    async def test_cluster_query_merges_all_hosts(self):
+        bus, managers, sids = await self._make_cluster()
+
+        result = await managers[0].get_cluster_participants('/', 'room1')
+
+        assert result.complete
+        assert result.missing_hosts == []
+        assert len(result) == 3
+        by_host = {p['host_id']: p for p in result}
+        assert set(by_host) == {'host-a', 'host-b', 'host-c'}
+        for host_id, participant in by_host.items():
+            assert participant['sid'] == sids[host_id]
+            assert participant['namespace'] == '/'
+            assert participant['rooms'] == [sids[host_id], 'room1']
+            assert participant['session'] == {}
+
+    async def test_cluster_query_single_host(self):
+        bus = _AsyncClusterBus()
+        pm = self._make_manager(bus, 'host-a')
+        sid = await pm.connect('eio-a', '/')
+        pm.basic_enter_room(sid, '/', 'room1')
+
+        # with no other known hosts the query returns immediately
+        result = await pm.get_cluster_participants('/', 'room1')
+        assert result.complete
+        assert result.missing_hosts == []
+        assert [p['sid'] for p in result] == [sid]
+
+        # operations on a purely local result do not hit the pub/sub backend
+        op = await result.join('room2')
+        assert op.complete
+        assert op.ok == [sid]
+        assert sid in pm.rooms['/']['room2']
+        assert [m for _, m in bus.published
+                if m['method'] == 'cluster_join'] == []
+
+    async def test_cluster_query_missing_host(self):
+        bus, managers, sids = await self._make_cluster()
+        bus.blocked.add('host-c')
+
+        result = await managers[0].get_cluster_participants(
+            '/', 'room1', timeout=0.01)
+
+        # the unresponsive host is reported and never assumed to be empty
+        assert not result.complete
+        assert result.missing_hosts == ['host-c']
+        assert {p['sid'] for p in result} == {sids['host-a'], sids['host-b']}
+
+    async def test_cluster_query_duplicate_response(self):
+        bus, managers, sids = await self._make_cluster()
+        original_publish = bus.publish
+
+        async def duplicate_publish(sender, message):
+            await original_publish(sender, message)
+            if message.get('method') == 'cluster_query_response':
+                await original_publish(sender, message)  # duplicate delivery
+
+        bus.publish = duplicate_publish
+
+        result = await managers[0].get_cluster_participants('/', 'room1')
+
+        assert result.complete
+        assert len(result) == 3
+        assert sorted(p['sid'] for p in result) == sorted(sids.values())
+
+    async def test_cluster_query_late_response(self):
+        bus, managers, sids = await self._make_cluster()
+        bus.blocked.add('host-c')
+
+        result = await managers[0].get_cluster_participants(
+            '/', 'room1', timeout=0.01)
+        assert result.missing_hosts == ['host-c']
+
+        # a response that arrives after the query completed is ignored
+        request_id = [m for _, m in bus.published
+                      if m['method'] == 'cluster_query'][-1]['request_id']
+        await managers[0]._process_message({
+            'method': 'cluster_query_response',
+            'request_id': request_id,
+            'host_id': 'host-c',
+            'participants': [{'sid': 'late-sid', 'namespace': '/',
+                              'rooms': [], 'token': 'x'}],
+        })
+
+        assert managers[0]._pending_requests == {}
+        assert {p['sid'] for p in result} == {sids['host-a'], sids['host-b']}
+
+    async def test_cluster_query_session_keys(self):
+        sessions = {}
+        for host in ('host-a', 'host-b', 'host-c'):
+            sessions[host] = {
+                host + '-sid-1': {
+                    'user': 'user-of-' + host,
+                    'auth_token': 'secret',
+                    'environ': {'wsgi.input': object()},
+                },
+            }
+        bus, managers, sids = await self._make_cluster(sessions=sessions)
+
+        # by default no session data is included in the result
+        result = await managers[0].get_cluster_participants('/', 'room1')
+        for participant in result:
+            assert participant['session'] == {}
+        for _, message in bus.published:
+            if message['method'] == 'cluster_query_response':
+                for participant in message['participants']:
+                    assert 'session' not in participant
+
+        # only the explicitly allowed keys are returned, and values that
+        # cannot be serialized (such as the request environ) are omitted
+        result = await managers[0].get_cluster_participants(
+            '/', 'room1', session_keys=['user', 'environ', 'missing'])
+        for participant in result:
+            assert participant['session'] == {
+                'user': 'user-of-' + participant['host_id']}
+
+    async def test_cluster_remote_operation_from_observer_host(self):
+        bus, managers, sids = await self._make_cluster()
+        # host-a has no clients in room1, so it is not a target of the
+        # operation it issues
+        managers[0].basic_leave_room(sids['host-a'], '/', 'room1')
+        # host-d has no clients in room1 either, so it ignores the operation
+        pm_d = self._make_manager(bus, 'host-d')
+        sid_d = await pm_d.connect('eio-d', '/')
+        await pm_d.emit('ping', 'x')
+
+        result = await managers[0].get_cluster_participants('/', 'room1')
+        assert result.complete
+        assert {p['sid'] for p in result} == {sids['host-b'], sids['host-c']}
+
+        op = await result.join('room2')
+        assert op.complete
+        assert op.ok == sorted([sids['host-b'], sids['host-c']])
+        assert sids['host-b'] in managers[1].rooms['/']['room2']
+        assert sids['host-c'] in managers[2].rooms['/']['room2']
+        assert sid_d not in pm_d.rooms['/'].get('room2', {})
+
+    async def test_cluster_remote_join_leave_disconnect(self):
+        bus, managers, sids = await self._make_cluster()
+        result = await managers[0].get_cluster_participants('/', 'room1')
+
+        op = await result.join('room2')
+        assert op == async_pubsub_manager.ClusterOperationResult(
+            ok=sorted(sids.values()))
+        assert repr(op) == ('ClusterOperationResult(ok={!r}, stale=[], '
+                            'unknown=[], missing_hosts=[])').format(
+                                sorted(sids.values()))
+        for pm in managers:
+            assert sids[pm.host_id] in pm.rooms['/']['room2']
+
+        op = await result.leave('room2')
+        assert op == async_pubsub_manager.ClusterOperationResult(
+            ok=sorted(sids.values()))
+        for pm in managers:
+            assert 'room2' not in pm.rooms['/']
+
+        op = await result.disconnect()
+        assert op == async_pubsub_manager.ClusterOperationResult(
+            ok=sorted(sids.values()))
+        for pm in managers:
+            pm.server.disconnect.assert_called_once_with(
+                sids[pm.host_id], '/', ignore_queue=True)
+
+    async def test_cluster_remote_operation_missing_host(self):
+        bus, managers, sids = await self._make_cluster()
+        result = await managers[0].get_cluster_participants('/', 'room1')
+        assert result.complete
+
+        # host-c becomes unresponsive after the query was made
+        bus.blocked.add('host-c')
+        op = await result.join('room2', timeout=0.01)
+        assert not op.complete
+        assert op.missing_hosts == ['host-c']
+        assert op.ok == sorted([sids['host-a'], sids['host-b']])
+        assert op.stale == []
+        assert op.unknown == [sids['host-c']]
+        assert 'room2' not in managers[2].rooms['/']
+
+    async def test_cluster_remote_operation_on_incomplete_query(self):
+        bus, managers, sids = await self._make_cluster()
+        bus.blocked.add('host-c')
+        result = await managers[0].get_cluster_participants(
+            '/', 'room1', timeout=0.01)
+        assert result.missing_hosts == ['host-c']
+
+        # the operation applies to the observed participants only
+        op = await result.join('room2')
+        assert op.complete
+        assert op.ok == sorted([sids['host-a'], sids['host-b']])
+        assert 'room2' not in managers[2].rooms['/']
+
+    async def test_cluster_remote_operation_stale(self):
+        bus, managers, sids = await self._make_cluster()
+        result = await managers[0].get_cluster_participants('/', 'room1')
+
+        # the client on host-b disconnects and reconnects after the query
+        managers[1].basic_disconnect(sids['host-b'], '/')
+        new_sid = await managers[1].connect('eio-new-b', '/')
+        managers[1].basic_enter_room(new_sid, '/', 'room1')
+
+        # the stale connection is reported and the new one is not affected
+        op = await result.join('room2')
+        assert op.ok == sorted([sids['host-a'], sids['host-c']])
+        assert op.stale == [sids['host-b']]
+        assert new_sid not in managers[1].rooms['/'].get('room2', {})
+
+        op = await result.disconnect()
+        assert op.ok == sorted([sids['host-a'], sids['host-c']])
+        assert op.stale == [sids['host-b']]
+        managers[1].server.disconnect.assert_not_called()
+        assert managers[1].is_connected(new_sid, '/')
+
+    async def test_cluster_remote_operation_requires_room(self):
+        bus, managers, sids = await self._make_cluster()
+        result = await managers[0].get_cluster_participants('/', 'room1')
+        with pytest.raises(ValueError):
+            await result.join(None)
+        with pytest.raises(ValueError):
+            await result.leave(None)
