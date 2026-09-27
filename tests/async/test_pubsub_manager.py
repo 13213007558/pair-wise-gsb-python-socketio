@@ -859,3 +859,200 @@ class TestAsyncPubSubManager:
 
         packet.Packet.json = saved_json
         EIOPacket.json = saved_json
+
+
+class AsyncFakeBus:
+    """Simulates a pub/sub channel interconnecting several managers."""
+
+    def __init__(self):
+        self.managers = []
+
+    def connect(self, pm):
+        self.managers.append(pm)
+
+        async def _publish(message, _pm=pm):
+            await self.publish(_pm, message)
+
+        pm._publish = _publish
+
+    def disconnect(self, pm):
+        self.managers.remove(pm)
+
+    async def publish(self, sender, message):
+        # the json round trip simulates the serialization on the channel
+        data = json.loads(json.dumps(message))
+        for pm in list(self.managers):
+            if pm is not sender:
+                await pm._handle_message(data)
+
+
+class TestAsyncPubSubManagerCluster:
+    def setup_method(self):
+        self.bus = AsyncFakeBus()
+        self.pm1 = self._make_manager('host1')
+        self.pm2 = self._make_manager('host2')
+        self.pm3 = self._make_manager('host3')
+
+    def _make_manager(self, host_id):
+        counter = [0]
+
+        def generate_id():
+            counter[0] += 1
+            return '{}-sid-{}'.format(host_id, counter[0])
+
+        mock_server = mock.MagicMock()
+        mock_server.eio.generate_id = generate_id
+        mock_server.packet_class = packet.Packet
+        mock_server._send_packet = mock.AsyncMock()
+        mock_server._send_eio_packet = mock.AsyncMock()
+        mock_server.disconnect = mock.AsyncMock()
+        mock_server.get_session = mock.AsyncMock(side_effect=KeyError)
+        pm = async_pubsub_manager.AsyncPubSubManager()
+        pm.host_id = host_id
+        pm.set_server(mock_server)
+        self.bus.connect(pm)
+        pm.initialize()
+        return pm
+
+    async def _connect(self, pm, eio_sid, namespace='/', rooms=(),
+                       session=None):
+        sid = await pm.connect(eio_sid, namespace)
+        for room in rooms:
+            pm.basic_enter_room(sid, namespace, room)
+        if session is not None:
+            async def get_session(sid, namespace=None, _session=session):
+                return _session
+            pm.server.get_session = get_session
+        return sid
+
+    async def test_query_connections_merges_cluster(self):
+        sid1 = await self._connect(self.pm1, 'eio-1', rooms=['room1'])
+        sid2 = await self._connect(
+            self.pm2, 'eio-2', rooms=['room1', 'room2'],
+            session={'username': 'bob', 'environ': object()})
+        sid3 = await self._connect(self.pm3, 'eio-3')
+
+        result = await self.pm1.query_connections(
+            '/', session_keys=['username'])
+
+        assert result.complete
+        assert result.missing_hosts == []
+        assert len(result) == 3
+        by_sid = {c.sid: c for c in result}
+        assert set(by_sid.keys()) == {sid1, sid2, sid3}
+        assert by_sid[sid1].host_id == 'host1'
+        assert by_sid[sid2].host_id == 'host2'
+        assert by_sid[sid3].host_id == 'host3'
+        assert set(by_sid[sid2].rooms) == {sid2, 'room1', 'room2'}
+        assert by_sid[sid2].session == {'username': 'bob'}
+        assert by_sid[sid1].session == {}
+
+    async def test_query_connections_no_session_by_default(self):
+        session = {'username': 'bob', 'environ': object()}
+        sid2 = await self._connect(self.pm2, 'eio-2', session=session)
+        self.pm2.server.get_session = mock.AsyncMock(
+            side_effect=AssertionError('session should not be read'))
+
+        result = await self.pm1.query_connections('/')
+
+        conn = [c for c in result if c.sid == sid2][0]
+        assert conn.session == {}
+        self.pm2.server.get_session.assert_not_called()
+
+    async def test_query_connections_missing_host(self):
+        sid1 = await self._connect(self.pm1, 'eio-1')
+        sid2 = await self._connect(self.pm2, 'eio-2')
+        await self._connect(self.pm3, 'eio-3')
+        # make host1 aware of host3 through regular traffic
+        await self.pm3.emit('hello', 'x')
+        assert 'host3' in self.pm1.known_hosts
+        # host3 goes away before the query
+        self.bus.disconnect(self.pm3)
+
+        result = await self.pm1.query_connections('/', timeout=0.05)
+
+        assert not result.complete
+        assert result.missing_hosts == ['host3']
+        assert {c.sid for c in result} == {sid1, sid2}
+
+    async def test_query_connections_duplicate_and_late_responses(self):
+        await self._connect(self.pm1, 'eio-1')
+        await self._connect(self.pm2, 'eio-2')
+        original_publish = self.bus.publish
+
+        async def duplicate_publish(sender, message):
+            await original_publish(sender, message)
+            if message.get('method') == 'query_connections_response':
+                await original_publish(sender, message)
+
+        self.bus.publish = duplicate_publish
+        result = await self.pm1.query_connections('/')
+        assert result.complete
+        assert len(result) == 2  # duplicate responses were merged
+
+        held = []
+
+        async def holding_publish(sender, message):
+            if message.get('method') == 'query_connections_response' and \
+                    sender is self.pm2:
+                held.append(message)  # hold the response until too late
+            else:
+                await original_publish(sender, message)
+
+        self.bus.publish = holding_publish
+        result = await self.pm1.query_connections('/', timeout=0.05)
+        assert result.missing_hosts == ['host2']
+        assert len(held) == 1
+
+        # the late response is silently dropped
+        self.bus.publish = original_publish
+        await self.bus.publish(self.pm2, held[0])
+        assert self.pm1._pending_queries == {}
+
+    async def test_remote_disconnect(self):
+        await self._connect(self.pm1, 'eio-1')
+        sid2 = await self._connect(self.pm2, 'eio-2')
+        result = await self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid2][0]
+
+        assert await conn.disconnect() == 'ok'
+        self.pm2.server.disconnect.assert_awaited_once_with(
+            sid=sid2, namespace='/', ignore_queue=True)
+
+    async def test_remote_join_and_leave(self):
+        sid2 = await self._connect(self.pm2, 'eio-2', rooms=['room1'])
+        result = await self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid2][0]
+
+        assert await conn.join('room2') == 'ok'
+        assert 'room2' in self.pm2.get_rooms(sid2, '/')
+        assert await conn.leave('room1') == 'ok'
+        assert 'room1' not in self.pm2.get_rooms(sid2, '/')
+
+    async def test_remote_op_stale_after_reconnect(self):
+        sid2 = await self._connect(self.pm2, 'eio-2', rooms=['room1'])
+        result = await self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid2][0]
+        # the client reconnects and its sid is reused by a new session
+        self.pm2.rooms['/'][None][sid2] = 'another-eio-sid'
+
+        assert await conn.leave('room1') == 'stale'
+        assert await conn.disconnect() == 'stale'
+        # the new session was not harmed by the stale operations
+        assert self.pm2.is_connected(sid2, '/')
+        assert 'room1' in self.pm2.get_rooms(sid2, '/')
+        self.pm2.server.disconnect.assert_not_called()
+
+    async def test_remote_op_timeout(self):
+        sid2 = await self._connect(self.pm2, 'eio-2')
+        result = await self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid2][0]
+        self.bus.disconnect(self.pm2)
+
+        assert await conn.disconnect(timeout=0.05) == 'timeout'
+        self.pm2.server.disconnect.assert_not_called()
+
+    async def test_query_connections_write_only(self):
+        pm = async_pubsub_manager.AsyncPubSubManager(write_only=True)
+        with pytest.raises(RuntimeError):
+            await pm.query_connections('/')

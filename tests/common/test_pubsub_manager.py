@@ -835,3 +835,257 @@ class TestPubSubManager:
 
         packet.Packet.json = saved_json
         EIOPacket.json = saved_json
+
+
+class FakeBus:
+    """Simulates a pub/sub channel interconnecting several managers."""
+
+    def __init__(self):
+        self.managers = []
+
+    def connect(self, pm):
+        self.managers.append(pm)
+        pm._publish = lambda message, _pm=pm: self.publish(_pm, message)
+
+    def disconnect(self, pm):
+        self.managers.remove(pm)
+
+    def publish(self, sender, message):
+        # the json round trip simulates the serialization on the channel
+        data = json.loads(json.dumps(message))
+        for pm in list(self.managers):
+            if pm is not sender:
+                pm._handle_message(data)
+
+
+class TestPubSubManagerCluster:
+    def setup_method(self):
+        self.bus = FakeBus()
+        self.pm1 = self._make_manager('host1')
+        self.pm2 = self._make_manager('host2')
+        self.pm3 = self._make_manager('host3')
+
+    def _make_manager(self, host_id):
+        counter = [0]
+
+        def generate_id():
+            counter[0] += 1
+            return '{}-sid-{}'.format(host_id, counter[0])
+
+        mock_server = mock.MagicMock()
+        mock_server.eio.generate_id = generate_id
+        mock_server.packet_class = packet.Packet
+        pm = pubsub_manager.PubSubManager()
+        pm.host_id = host_id
+        pm.set_server(mock_server)
+        self.bus.connect(pm)
+        pm.initialize()
+        return pm
+
+    def _connect(self, pm, eio_sid, namespace='/', rooms=(), session=None):
+        sid = pm.connect(eio_sid, namespace)
+        for room in rooms:
+            pm.basic_enter_room(sid, namespace, room)
+        if session is not None:
+            pm.server.get_session = lambda sid, namespace=None: session
+        return sid
+
+    def test_query_connections_merges_cluster(self):
+        sid1 = self._connect(self.pm1, 'eio-1', rooms=['room1'])
+        sid2 = self._connect(self.pm2, 'eio-2', rooms=['room1', 'room2'])
+        sid3 = self._connect(self.pm2, 'eio-3')
+        self._connect(self.pm3, 'eio-4', namespace='/chat')
+
+        result = self.pm1.query_connections('/')
+
+        assert result.complete
+        assert result.missing_hosts == []
+        assert len(result) == 3
+        by_sid = {c.sid: c for c in result}
+        assert set(by_sid.keys()) == {sid1, sid2, sid3}
+        assert by_sid[sid1].host_id == 'host1'
+        assert by_sid[sid2].host_id == 'host2'
+        assert by_sid[sid3].host_id == 'host2'
+        assert all(c.namespace == '/' for c in result)
+        assert set(by_sid[sid1].rooms) == {sid1, 'room1'}
+        assert set(by_sid[sid2].rooms) == {sid2, 'room1', 'room2'}
+        assert by_sid[sid3].rooms == [sid3]
+        assert all(c.session == {} for c in result)
+
+    def test_query_connections_room_filter(self):
+        sid1 = self._connect(self.pm1, 'eio-1', rooms=['room1'])
+        sid2 = self._connect(self.pm2, 'eio-2', rooms=['room1'])
+        self._connect(self.pm2, 'eio-3', rooms=['room2'])
+
+        result = self.pm1.query_connections('/', room='room1')
+
+        assert result.complete
+        assert {c.sid for c in result} == {sid1, sid2}
+
+    def test_query_connections_namespace_filter(self):
+        self._connect(self.pm1, 'eio-1')
+        sid2 = self._connect(self.pm2, 'eio-2', namespace='/chat')
+
+        result = self.pm1.query_connections('/chat')
+
+        assert result.complete
+        assert [c.sid for c in result] == [sid2]
+        assert result.connections[0].namespace == '/chat'
+
+    def test_query_connections_session_keys(self):
+        environ = object()  # sensitive and not json serializable
+        session = {'username': 'bob', 'environ': environ}
+        sid2 = self._connect(self.pm2, 'eio-2', session=session)
+
+        result = self.pm1.query_connections(
+            '/', session_keys=['username', 'missing'])
+
+        conn = [c for c in result if c.sid == sid2][0]
+        assert conn.session == {'username': 'bob'}
+
+    def test_query_connections_no_session_by_default(self):
+        environ = object()  # sensitive and not json serializable
+        session = {'username': 'bob', 'environ': environ}
+        sid2 = self._connect(self.pm2, 'eio-2', session=session)
+        self.pm2.server.get_session = mock.MagicMock(
+            side_effect=AssertionError('session should not be read'))
+
+        result = self.pm1.query_connections('/')
+
+        conn = [c for c in result if c.sid == sid2][0]
+        assert conn.session == {}
+        self.pm2.server.get_session.assert_not_called()
+
+    def test_query_connections_missing_host(self):
+        sid1 = self._connect(self.pm1, 'eio-1')
+        sid2 = self._connect(self.pm2, 'eio-2')
+        self._connect(self.pm3, 'eio-3')
+        # make host1 aware of host3 through regular traffic
+        self.pm3.emit('hello', 'x')
+        assert 'host3' in self.pm1.known_hosts
+        # host3 goes away before the query
+        self.bus.disconnect(self.pm3)
+
+        result = self.pm1.query_connections('/', timeout=0.05)
+
+        assert not result.complete
+        assert result.missing_hosts == ['host3']
+        assert {c.sid for c in result} == {sid1, sid2}
+
+    def test_query_connections_duplicate_response(self):
+        self._connect(self.pm1, 'eio-1')
+        self._connect(self.pm2, 'eio-2')
+        self._connect(self.pm3, 'eio-3')
+        original_publish = self.bus.publish
+
+        def duplicate_publish(sender, message):
+            original_publish(sender, message)
+            if message.get('method') == 'query_connections_response':
+                original_publish(sender, message)  # duplicate delivery
+
+        self.bus.publish = duplicate_publish
+        result = self.pm1.query_connections('/')
+
+        assert result.complete
+        assert len(result) == 3  # one connection per host, no duplicates
+
+    def test_query_connections_late_response(self):
+        self._connect(self.pm2, 'eio-2')
+        # make host1 aware of host2 through regular traffic
+        self.pm2.emit('hello', 'x')
+        held = []
+        original_publish = self.bus.publish
+
+        def holding_publish(sender, message):
+            if message.get('method') == 'query_connections_response' and \
+                    sender is self.pm2:
+                held.append(message)  # hold the response until too late
+            else:
+                original_publish(sender, message)
+
+        self.bus.publish = holding_publish
+        result = self.pm1.query_connections('/', timeout=0.05)
+
+        assert not result.complete
+        assert result.missing_hosts == ['host2']
+        assert len(held) == 1
+
+        # the late response is silently dropped
+        self.bus.publish = original_publish
+        self.bus.publish(self.pm2, held[0])
+        assert self.pm1._pending_queries == {}
+
+    def test_query_connections_write_only(self):
+        pm = pubsub_manager.PubSubManager(write_only=True)
+        with pytest.raises(RuntimeError):
+            pm.query_connections('/')
+
+    def test_remote_disconnect(self):
+        self._connect(self.pm1, 'eio-1')
+        sid2 = self._connect(self.pm2, 'eio-2')
+        result = self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid2][0]
+
+        assert conn.disconnect() == 'ok'
+        self.pm2.server.disconnect.assert_called_once_with(
+            sid=sid2, namespace='/', ignore_queue=True)
+
+    def test_remote_join_and_leave(self):
+        sid2 = self._connect(self.pm2, 'eio-2', rooms=['room1'])
+        result = self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid2][0]
+
+        assert conn.join('room2') == 'ok'
+        assert 'room2' in self.pm2.get_rooms(sid2, '/')
+        assert conn.leave('room1') == 'ok'
+        assert 'room1' not in self.pm2.get_rooms(sid2, '/')
+
+    def test_remote_op_on_local_connection(self):
+        sid1 = self._connect(self.pm1, 'eio-1')
+        result = self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid1][0]
+
+        assert conn.join('room1') == 'ok'
+        assert 'room1' in self.pm1.get_rooms(sid1, '/')
+
+    def test_remote_op_stale_after_disconnect(self):
+        sid2 = self._connect(self.pm2, 'eio-2')
+        result = self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid2][0]
+        self.pm2.basic_disconnect(sid2, '/')
+
+        assert conn.disconnect() == 'stale'
+        self.pm2.server.disconnect.assert_not_called()
+        assert conn.join('room1') == 'stale'
+        assert self.pm2.get_rooms(sid2, '/') == []
+
+    def test_remote_op_stale_after_reconnect(self):
+        sid2 = self._connect(self.pm2, 'eio-2', rooms=['room1'])
+        result = self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid2][0]
+        # the client reconnects and its sid is reused by a new session
+        self.pm2.rooms['/'][None][sid2] = 'another-eio-sid'
+
+        assert conn.leave('room1') == 'stale'
+        assert conn.disconnect() == 'stale'
+        # the new session was not harmed by the stale operations
+        assert self.pm2.is_connected(sid2, '/')
+        assert 'room1' in self.pm2.get_rooms(sid2, '/')
+        self.pm2.server.disconnect.assert_not_called()
+
+    def test_remote_op_timeout(self):
+        sid2 = self._connect(self.pm2, 'eio-2')
+        result = self.pm1.query_connections('/')
+        conn = [c for c in result if c.sid == sid2][0]
+        self.bus.disconnect(self.pm2)
+
+        assert conn.disconnect(timeout=0.05) == 'timeout'
+        self.pm2.server.disconnect.assert_not_called()
+
+    def test_remote_op_write_only(self):
+        pm = pubsub_manager.PubSubManager(write_only=True)
+        conn = pubsub_manager.ClusterConnection(
+            pm, host_id='host2', sid='sid', namespace='/', rooms=[],
+            session={}, token='token')
+        with pytest.raises(RuntimeError):
+            conn.disconnect()

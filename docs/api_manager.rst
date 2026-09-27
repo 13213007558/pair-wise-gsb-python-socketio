@@ -9,6 +9,12 @@ Managers
    :members:
    :inherited-members:
 
+.. autoclass:: socketio.pubsub_manager.ClusterConnections
+   :members:
+
+.. autoclass:: socketio.pubsub_manager.ClusterConnection
+   :members:
+
 .. autoclass:: socketio.KombuManager
    :members:
    :inherited-members:
@@ -36,4 +42,3 @@ Managers
 .. autoclass:: socketio.AsyncAioPikaManager
    :members:
    :inherited-members:
-

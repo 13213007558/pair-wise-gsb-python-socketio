@@ -1,9 +1,110 @@
 import base64
 from functools import partial
+import threading
+import time
 import uuid
 
 from .manager import Manager
 from .packet import Packet
+
+
+class ClusterConnection:
+    """A connection observed on a node of the cluster.
+
+    Instances of this class are returned by
+    :meth:`PubSubManager.query_connections` and represent the state of a
+    connection at the time the query ran. The ``join()``, ``leave()`` and
+    ``disconnect()`` methods issue operations against the node that owns the
+    connection. If the connection went away or was replaced by a new session
+    since the query ran, these operations report ``'stale'`` and have no
+    effect.
+
+    :param manager: the manager that produced this result.
+    :param host_id: the id of the node that owns the connection.
+    :param sid: the Socket.IO session id of the connection.
+    :param namespace: the namespace of the connection.
+    :param rooms: the rooms the connection was in when the query ran.
+    :param session: the session data that was explicitly requested in the
+                    query.
+    :param token: an opaque token that identifies this exact connection
+                  instance, used to detect stale operations.
+    """
+    def __init__(self, manager, host_id, sid, namespace, rooms, session,
+                 token):
+        self.manager = manager
+        self.host_id = host_id
+        self.sid = sid
+        self.namespace = namespace
+        self.rooms = rooms
+        self.session = session
+        self.token = token
+
+    def join(self, room, timeout=5):
+        """Add this connection to a room on the node that owns it.
+
+        :param room: the room to join.
+        :param timeout: how long to wait for a response from the node.
+
+        Returns ``'ok'`` if the operation was applied, ``'stale'`` if the
+        connection no longer matches the observed state, or ``'timeout'`` if
+        the node did not respond in time.
+        """
+        return self.manager._remote_op('join', self, room=room,
+                                       timeout=timeout)
+
+    def leave(self, room, timeout=5):
+        """Remove this connection from a room on the node that owns it.
+
+        :param room: the room to leave.
+        :param timeout: how long to wait for a response from the node.
+
+        The return value is the same as in :meth:`join`.
+        """
+        return self.manager._remote_op('leave', self, room=room,
+                                       timeout=timeout)
+
+    def disconnect(self, timeout=5):
+        """Disconnect this connection on the node that owns it.
+
+        :param timeout: how long to wait for a response from the node.
+
+        The return value is the same as in :meth:`join`.
+        """
+        return self.manager._remote_op('disconnect', self, timeout=timeout)
+
+    def __repr__(self):
+        return '<ClusterConnection sid={} namespace={} host={}>'.format(
+            self.sid, self.namespace, self.host_id)
+
+
+class ClusterConnections:
+    """Result of a cluster-wide connection query.
+
+    This is a point-in-time observation of the cluster, assembled from the
+    responses received while the query ran. It is not a globally consistent
+    snapshot.
+
+    :param connections: a list of :class:`ClusterConnection` objects.
+    :param missing_hosts: a list of host ids that were known to the cluster
+                          but did not respond to the query in time. A host
+                          listed here may still have connections, so its
+                          absence from ``connections`` must not be
+                          interpreted as a lack of connections.
+    """
+    def __init__(self, connections, missing_hosts):
+        self.connections = connections
+        self.missing_hosts = missing_hosts
+
+    @property
+    def complete(self):
+        """``True`` if all the known hosts responded to the query."""
+        return len(self.missing_hosts) == 0
+
+    def __iter__(self):
+        return iter(self.connections)
+
+    def __len__(self):
+        return len(self.connections)
 
 
 class PubSubManager(Manager):
@@ -42,6 +143,9 @@ class PubSubManager(Manager):
         self.write_only = write_only
         self.host_id = uuid.uuid4().hex
         self.logger = logger
+        self.known_hosts = set()
+        self._pending_queries = {}
+        self._pending_ops = {}
         if json is not None:
             self.json = json
 
@@ -135,6 +239,104 @@ class PubSubManager(Manager):
         self._handle_close_room(message)  # handle in this host
         self._publish(message)  # notify other hosts
 
+    def query_connections(self, namespace=None, room=None, session_keys=None,
+                          timeout=5):
+        """Query the cluster for connections.
+
+        This method asks all the nodes in the cluster to report their
+        connections, and returns the aggregated result. Unlike
+        :meth:`get_participants`, which only reports the connections that
+        are local to this process, this method includes connections from all
+        the nodes that respond.
+
+        The result is a point-in-time observation of the cluster assembled
+        from the responses received while the query runs. It is not a
+        globally consistent snapshot. Nodes that are known to the cluster
+        but fail to respond in time are reported in the result's
+        ``missing_hosts`` attribute; a missing node must not be interpreted
+        as a node without connections.
+
+        :param namespace: The Socket.IO namespace to query. If omitted, the
+                          default namespace is used.
+        :param room: If given, only connections that are in this room are
+                     returned. If omitted, all the connections in the
+                     namespace are returned.
+        :param session_keys: An optional list of session keys to include in
+                             the result. Only the given keys are read from
+                             each connection's session. If omitted, no
+                             session data is collected, so sensitive data
+                             stored in the session (such as the request
+                             environment) is never serialized onto the
+                             pub/sub channel unless explicitly requested.
+        :param timeout: How long to wait for responses from the nodes of
+                        the cluster, in seconds.
+
+        The return value is a :class:`ClusterConnections` object.
+        """
+        if self.server is None:
+            raise RuntimeError('Connections can only be queried from the '
+                               'context of a server.')
+        namespace = namespace or '/'
+        query_id = uuid.uuid4().hex
+        pending = {'responses': {}, 'event': threading.Event()}
+        self._pending_queries[query_id] = pending
+        try:
+            message = {'method': 'query_connections', 'query_id': query_id,
+                       'namespace': namespace, 'room': room,
+                       'session_keys': session_keys, 'host_id': self.host_id}
+            self._handle_query_connections(message)  # handle in this host
+            self._publish(message)  # ask the other hosts
+            deadline = time.monotonic() + timeout
+            while True:
+                expected = self.known_hosts | {self.host_id}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or \
+                        expected.issubset(pending['responses'].keys()):
+                    break
+                pending['event'].wait(remaining)
+        finally:
+            self._pending_queries.pop(query_id, None)
+        connections = []
+        for host_id, host_connections in pending['responses'].items():
+            for c in host_connections:
+                connections.append(ClusterConnection(
+                    self, host_id=host_id, sid=c['sid'],
+                    namespace=c['namespace'], rooms=c['rooms'],
+                    session=c['session'], token=c['token']))
+        missing_hosts = list(
+            (self.known_hosts | {self.host_id}) - pending['responses'].keys())
+        return ClusterConnections(connections, missing_hosts)
+
+    def _remote_op(self, op, connection, room=None, timeout=5):
+        """Perform a room or disconnect operation on the node that owns a
+        connection returned by :meth:`query_connections`.
+
+        Returns ``'ok'`` if the operation was applied, ``'stale'`` if the
+        connection no longer matches the observed state, or ``'timeout'`` if
+        the node did not respond in time.
+        """
+        if self.server is None:
+            raise RuntimeError('Remote operations can only be issued from '
+                               'the context of a server.')
+        request_id = uuid.uuid4().hex
+        pending = {'status': None, 'event': threading.Event()}
+        self._pending_ops[request_id] = pending
+        try:
+            message = {'method': 'remote_op', 'op': op,
+                       'request_id': request_id,
+                       'target_host': connection.host_id,
+                       'sid': connection.sid,
+                       'namespace': connection.namespace, 'room': room,
+                       'token': connection.token, 'host_id': self.host_id}
+            if connection.host_id == self.host_id:
+                self._handle_remote_op(message)  # handle in this host
+            else:
+                self._publish(message)  # send to the owning host
+            pending['event'].wait(timeout)
+            return pending['status'] or 'timeout'
+        finally:
+            self._pending_ops.pop(request_id, None)
+
     def _publish(self, data):
         """Publish a message on the Socket.IO channel.
 
@@ -220,6 +422,123 @@ class PubSubManager(Manager):
         super().close_room(room=message.get('room'),
                            namespace=message.get('namespace'))
 
+    def _get_connection_info(self, sid, namespace, session_keys):
+        session = {}
+        if session_keys:
+            try:
+                s = self.server.get_session(sid, namespace=namespace)
+            except KeyError:
+                s = {}
+            session = {k: s[k] for k in session_keys if k in s}
+        return {'sid': sid, 'namespace': namespace,
+                'rooms': self.get_rooms(sid, namespace),
+                'session': session,
+                'token': self.eio_sid_from_sid(sid, namespace)}
+
+    def _handle_query_connections(self, message):
+        namespace = message.get('namespace') or '/'
+        room = message.get('room')
+        if room is None:
+            sids = [sid for sid in self.rooms.get(namespace, {}).get(None, {})
+                    if self.is_connected(sid, namespace)]
+        else:
+            sids = [sid for sid, _ in self.get_participants(namespace, room)]
+        connections = [
+            self._get_connection_info(sid, namespace,
+                                      message.get('session_keys'))
+            for sid in sids
+        ]
+        response = {'method': 'query_connections_response',
+                    'query_id': message.get('query_id'),
+                    'host_id': self.host_id,
+                    'target_host': message.get('host_id'),
+                    'connections': connections}
+        if message.get('host_id') == self.host_id:
+            self._handle_query_connections_response(response)
+        else:
+            self._publish(response)
+
+    def _handle_query_connections_response(self, message):
+        if message.get('target_host') != self.host_id:
+            return
+        pending = self._pending_queries.get(message.get('query_id'))
+        if pending is None:
+            # the query already finished, so this is a late response
+            return
+        host_id = message.get('host_id')
+        if host_id not in pending['responses']:
+            pending['responses'][host_id] = message.get('connections') or []
+            pending['event'].set()
+
+    def _handle_remote_op(self, message):
+        if message.get('target_host') != self.host_id:
+            return
+        status = self._execute_remote_op(message)
+        response = {'method': 'remote_op_response',
+                    'request_id': message.get('request_id'),
+                    'status': status, 'host_id': self.host_id,
+                    'target_host': message.get('host_id')}
+        if message.get('host_id') == self.host_id:
+            self._handle_remote_op_response(response)
+        else:
+            self._publish(response)
+
+    def _execute_remote_op(self, message):
+        sid = message.get('sid')
+        namespace = message.get('namespace') or '/'
+        if not self.is_connected(sid, namespace) or \
+                self.eio_sid_from_sid(sid, namespace) != message.get('token'):
+            # the connection went away or was replaced by a new session
+            # since the query ran, so the operation must not be applied
+            return 'stale'
+        op = message.get('op')
+        if op == 'join':
+            super().enter_room(sid, namespace, message.get('room'))
+        elif op == 'leave':
+            super().leave_room(sid, namespace, message.get('room'))
+        elif op == 'disconnect':
+            self.server.disconnect(sid=sid, namespace=namespace,
+                                   ignore_queue=True)
+        else:
+            return 'error'
+        return 'ok'
+
+    def _handle_remote_op_response(self, message):
+        if message.get('target_host') != self.host_id:
+            return
+        pending = self._pending_ops.get(message.get('request_id'))
+        if pending is None or pending['status'] is not None:
+            # late or duplicate response
+            return
+        pending['status'] = message.get('status')
+        pending['event'].set()
+
+    def _handle_message(self, data):
+        host_id = data.get('host_id')
+        if host_id is not None and host_id != self.host_id:
+            self.known_hosts.add(host_id)
+        if data['method'] == 'callback':
+            self._handle_callback(data)
+        elif host_id != self.host_id:
+            if data['method'] == 'emit':
+                self._handle_emit(data)
+            elif data['method'] == 'disconnect':
+                self._handle_disconnect(data)
+            elif data['method'] == 'enter_room':
+                self._handle_enter_room(data)
+            elif data['method'] == 'leave_room':
+                self._handle_leave_room(data)
+            elif data['method'] == 'close_room':
+                self._handle_close_room(data)
+            elif data['method'] == 'query_connections':
+                self._handle_query_connections(data)
+            elif data['method'] == 'query_connections_response':
+                self._handle_query_connections_response(data)
+            elif data['method'] == 'remote_op':
+                self._handle_remote_op(data)
+            elif data['method'] == 'remote_op_response':
+                self._handle_remote_op_response(data)
+
     def _thread(self):
         while True:
             try:
@@ -236,19 +555,7 @@ class PubSubManager(Manager):
                         self._get_logger().debug('pubsub message: {}'.format(
                             data['method']))
                         try:
-                            if data['method'] == 'callback':
-                                self._handle_callback(data)
-                            elif data.get('host_id') != self.host_id:
-                                if data['method'] == 'emit':
-                                    self._handle_emit(data)
-                                elif data['method'] == 'disconnect':
-                                    self._handle_disconnect(data)
-                                elif data['method'] == 'enter_room':
-                                    self._handle_enter_room(data)
-                                elif data['method'] == 'leave_room':
-                                    self._handle_leave_room(data)
-                                elif data['method'] == 'close_room':
-                                    self._handle_close_room(data)
+                            self._handle_message(data)
                         except Exception:
                             self.server.logger.exception(
                                 'Handler error in pubsub listening thread')
