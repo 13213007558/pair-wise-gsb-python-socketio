@@ -17,6 +17,10 @@ Managers
    :members:
    :inherited-members:
 
+.. autoclass:: socketio.RedisNodeManager
+   :members:
+   :inherited-members:
+
 .. autoclass:: socketio.KafkaManager
    :members:
    :inherited-members:
@@ -36,4 +40,3 @@ Managers
 .. autoclass:: socketio.AsyncAioPikaManager
    :members:
    :inherited-members:
-

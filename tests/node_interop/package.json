@@ -1,0 +1,11 @@
+{
+  "name": "socketio-redis-node-interop-tests",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Acceptance tests for RedisNodeManager against the Node.js @socket.io/redis-adapter 8.x broadcast protocol",
+  "dependencies": {
+    "msgpackr": "1.11.12",
+    "socket.io-adapter": "2.5.7",
+    "socket.io-parser": "4.2.6"
+  }
+}

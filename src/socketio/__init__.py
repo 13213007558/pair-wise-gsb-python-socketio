@@ -4,6 +4,7 @@ from .manager import Manager
 from .pubsub_manager import PubSubManager
 from .kombu_manager import KombuManager
 from .redis_manager import RedisManager
+from .redis_manager import RedisNodeManager
 from .kafka_manager import KafkaManager
 from .zmq_manager import ZmqManager
 from .server import Server
@@ -20,7 +21,8 @@ from .async_aiopika_manager import AsyncAioPikaManager
 from .asgi import ASGIApp
 
 __all__ = ['SimpleClient', 'Client', 'Server', 'Manager', 'PubSubManager',
-           'KombuManager', 'RedisManager', 'ZmqManager', 'KafkaManager',
+           'KombuManager', 'RedisManager', 'RedisNodeManager', 'ZmqManager',
+           'KafkaManager',
            'Namespace', 'ClientNamespace', 'WSGIApp', 'Middleware',
            'AsyncSimpleClient', 'AsyncClient', 'AsyncServer',
            'AsyncNamespace', 'AsyncClientNamespace', 'AsyncManager',

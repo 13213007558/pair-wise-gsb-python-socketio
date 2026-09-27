@@ -1033,6 +1033,21 @@ the Redis store and use the queue's pub/sub functionality::
 The ``client_manager`` argument instructs the server to connect to the given
 message queue, and to coordinate with other processes connected to the queue.
 
+To share the Redis queue with Socket.IO servers written in Node.js, the
+:class:`socketio.RedisNodeManager` class can be used instead. This class
+implements the broadcast protocol used by the official
+`@socket.io/redis-adapter <https://github.com/socketio/socket.io-redis-adapter>`_
+package for Node.js (version 8.x), allowing Python and Node.js servers to
+broadcast events to each other's clients::
+
+    mgr = socketio.RedisNodeManager('redis://')
+    sio = socketio.Server(client_manager=mgr)
+
+Note that the message format used by :class:`socketio.RedisNodeManager` is
+not compatible with the one used by :class:`socketio.RedisManager`, so the
+two classes cannot be mixed in the same deployment. The ``msgpack`` Python
+package is required by this manager.
+
 Kombu
 ~~~~~
 
