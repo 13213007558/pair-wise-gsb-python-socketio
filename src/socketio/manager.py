@@ -48,8 +48,12 @@ class Manager(base_manager.BaseManager):
                        for p in encoded_packet]
             for sid, eio_sid in self.get_participants(namespace, room):
                 if sid not in skip_sid:
-                    for p in eio_pkt:
-                        self.server._send_eio_packet(eio_sid, p)
+                    # all the frames of the packet are sent to each client
+                    # under the connection's send lock, so that frames from
+                    # other packets cannot be interleaved in between
+                    with self.server._send_lock(eio_sid):
+                        for p in eio_pkt:
+                            self.server._send_eio_packet(eio_sid, p)
         else:
             # callbacks are used, so each recipient must be sent a packet that
             # contains a unique callback id

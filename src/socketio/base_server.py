@@ -1,4 +1,6 @@
+import contextlib
 import logging
+import threading
 
 import engineio
 
@@ -15,7 +17,7 @@ class BaseServer:
 
     def __init__(self, client_manager=None, logger=False, serializer='default',
                  json=None, async_handlers=True, always_connect=False,
-                 namespaces=None, **kwargs):
+                 namespaces=None, ordered_send=False, **kwargs):
         engineio_options = kwargs
         engineio_logger = engineio_options.pop('engineio_logger', None)
         if engineio_logger is not None:
@@ -64,7 +66,41 @@ class BaseServer:
         self.always_connect = always_connect
         self.namespaces = namespaces or ['/']
 
+        # when ordered_send is enabled, a lock is kept for each Engine.IO
+        # connection, so that all the frames that make up a Socket.IO packet
+        # (including any binary attachments) are sent contiguously, even when
+        # multiple threads or tasks emit to the same client concurrently
+        self.ordered_send = ordered_send
+        self._send_locks = {}
+        self._send_locks_lock = threading.Lock()
+
         self.async_mode = self.eio.async_mode
+
+    def _new_send_lock(self):
+        """Create a new send lock. Subclasses can override this method to
+        provide a lock class that is appropriate for their async model."""
+        return threading.Lock()
+
+    def _get_send_lock(self, eio_sid):
+        """Return the send lock for an Engine.IO connection, creating it if
+        it does not exist yet."""
+        try:
+            return self._send_locks[eio_sid]
+        except KeyError:
+            with self._send_locks_lock:
+                if eio_sid not in self._send_locks:
+                    self._send_locks[eio_sid] = self._new_send_lock()
+                return self._send_locks[eio_sid]
+
+    def _send_lock(self, eio_sid):
+        """Return a context manager that ensures that all the frames of a
+        Socket.IO packet are sent to the given Engine.IO connection without
+        frames from other packets interleaved in between. When the
+        ordered_send option is disabled this is a no-op context manager.
+        """
+        if self.ordered_send:
+            return self._get_send_lock(eio_sid)
+        return contextlib.nullcontext()
 
     def is_asyncio_based(self):
         return False

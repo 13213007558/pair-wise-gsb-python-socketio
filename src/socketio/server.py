@@ -54,6 +54,15 @@ class Server(base_server.BaseServer):
                        default is `['/']`, which always accepts connections to
                        the default namespace. Set to `'*'` to accept all
                        namespaces.
+    :param ordered_send: When set to `True`, packets sent to the same client
+                         connection are serialized, so that a packet and all
+                         its binary attachments are always sent contiguously,
+                         even when multiple threads emit to the same client
+                         at the same time. Sends to different clients can
+                         still occur in parallel. The default is `False`,
+                         which preserves the previous behavior, in which
+                         concurrent emits to the same client can interleave
+                         the frames of their packets.
     :param kwargs: Connection parameters for the underlying Engine.IO server.
 
     The Engine.IO configuration supports the following settings:
@@ -154,11 +163,12 @@ class Server(base_server.BaseServer):
                              to always leave this parameter with its default
                              value of ``False``.
 
-        Note: this method is not thread safe. If multiple threads are emitting
-        at the same time to the same client, then messages composed of
-        multiple packets may end up being sent in an incorrect sequence. Use
-        standard concurrency solutions (such as a Lock object) to prevent this
-        situation.
+        Note: this method is not thread safe by default. If multiple threads
+        are emitting at the same time to the same client, then messages
+        composed of multiple packets may end up being sent in an incorrect
+        sequence. Use standard concurrency solutions (such as a Lock object)
+        to prevent this situation, or set the `ordered_send` option to
+        `True` to have the server serialize the packets sent to each client.
         """
         namespace = namespace or '/'
         room = to or room
@@ -243,11 +253,12 @@ class Server(base_server.BaseServer):
                              to always leave this parameter with its default
                              value of ``False``.
 
-        Note: this method is not thread safe. If multiple threads are emitting
-        at the same time to the same client, then messages composed of
-        multiple packets may end up being sent in an incorrect sequence. Use
-        standard concurrency solutions (such as a Lock object) to prevent this
-        situation.
+        Note: this method is not thread safe by default. If multiple threads
+        are emitting at the same time to the same client, then messages
+        composed of multiple packets may end up being sent in an incorrect
+        sequence. Use standard concurrency solutions (such as a Lock object)
+        to prevent this situation, or set the `ordered_send` option to
+        `True` to have the server serialize the packets sent to each client.
         """
         if to is None and sid is None:
             raise ValueError('Cannot use call() to broadcast.')
@@ -505,11 +516,31 @@ class Server(base_server.BaseServer):
     def _send_packet(self, eio_sid, pkt):
         """Send a Socket.IO packet to a client."""
         encoded_packet = pkt.encode()
-        if isinstance(encoded_packet, list):
-            for ep in encoded_packet:
-                self.eio.send(eio_sid, ep)
-        else:
-            self.eio.send(eio_sid, encoded_packet)
+        if not isinstance(encoded_packet, list):
+            encoded_packet = [encoded_packet]
+        with self._send_lock(eio_sid):
+            self._send_frames(eio_sid, encoded_packet)
+
+    def _send_frames(self, eio_sid, frames):
+        """Send all the frames of an encoded packet to a client.
+
+        If the send is interrupted (for example, by an error or by the
+        cancellation of the calling task), the remaining frames are still
+        sent, so that the client is not left with a partial packet that
+        would corrupt the interpretation of the next one.
+        """
+        sent = 0
+        try:
+            for frame in frames:
+                self.eio.send(eio_sid, frame)
+                sent += 1
+        except BaseException:
+            for frame in frames[sent:]:
+                try:
+                    self.eio.send(eio_sid, frame)
+                except Exception:
+                    pass
+            raise
 
     def _send_eio_packet(self, eio_sid, eio_pkt):
         """Send a raw Engine.IO packet to a client."""
@@ -693,6 +724,7 @@ class Server(base_server.BaseServer):
             self._handle_disconnect(eio_sid, n, reason)
         if eio_sid in self.environ:
             del self.environ[eio_sid]
+        self._send_locks.pop(eio_sid, None)
 
     def _engineio_server_class(self):
         return engineio.Server

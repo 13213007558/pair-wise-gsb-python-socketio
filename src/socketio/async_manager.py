@@ -44,9 +44,11 @@ class AsyncManager(BaseManager):
                        for p in encoded_packet]
             for sid, eio_sid in self.get_participants(namespace, room):
                 if sid not in skip_sid:
-                    for p in eio_pkt:
-                        tasks.append(asyncio.create_task(
-                            self.server._send_eio_packet(eio_sid, p)))
+                    # each client receives all the frames of the packet from
+                    # a single task, so that frames from other packets
+                    # cannot be interleaved in between
+                    tasks.append(asyncio.create_task(
+                        self._send_eio_packets(eio_sid, eio_pkt)))
         else:
             # callbacks are used, so each recipient must be sent a packet that
             # contains a unique callback id
@@ -63,6 +65,30 @@ class AsyncManager(BaseManager):
         if tasks == []:  # pragma: no cover
             return
         await asyncio.wait(tasks)
+
+    async def _send_eio_packets(self, eio_sid, eio_packets):
+        """Send all the Engine.IO packets that make up a Socket.IO packet
+        to a client, under the connection's send lock.
+
+        If the task is cancelled after part of the packet was sent, the
+        remaining frames are still sent, shielded from further
+        cancellations, so that the client is not left with a partial
+        packet that would corrupt the interpretation of the next one.
+        """
+        async with self.server._send_lock(eio_sid):
+            sent = 0
+            try:
+                for p in eio_packets:
+                    await self.server._send_eio_packet(eio_sid, p)
+                    sent += 1
+            except asyncio.CancelledError:
+                for p in eio_packets[sent:]:
+                    try:
+                        await asyncio.shield(
+                            self.server._send_eio_packet(eio_sid, p))
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                raise
 
     async def connect(self, eio_sid, namespace):
         """Register a client connection to a namespace.
