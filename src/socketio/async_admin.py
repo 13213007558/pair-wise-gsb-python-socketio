@@ -14,6 +14,16 @@ PID = os.getpid()
 
 
 class InstrumentedAsyncServer:
+    # Registry of the Engine.IO servers that are currently instrumented in
+    # this process, as a dict of Engine.IO server instance to a list of
+    # InstrumentedAsyncServer instances. The Engine.IO socket class is
+    # patched only once (when the first server is instrumented) and restored
+    # when the last one is uninstrumented. The shared patches use this
+    # registry to route metrics to the instrumented server(s) that own each
+    # socket, so that multiple instrumented servers can coexist in the
+    # process without interfering with each other.
+    _instrumented_eio_servers = {}
+
     def __init__(self, sio, auth=None, namespace='/admin', read_only=False,
                  server_id=None, mode='development', server_stats_interval=2):
         """Instrument the Socket.IO server for monitoring with the `Socket.IO
@@ -38,10 +48,18 @@ class InstrumentedAsyncServer:
         self.stop_stats_event = None
         self.stats_task = None
 
+        # whether the Engine.IO socket class patches are registered
+        self._instrumented = False
+
         # monkey-patch the server to report metrics to the admin UI
         self.instrument()
 
     def instrument(self):
+        if self._instrumented:
+            # instrumenting an already instrumented server is a no-op
+            return
+        self._instrumented = True
+
         self.sio.on('connect', self.admin_connect,
                     namespace=self.admin_namespace)
 
@@ -59,62 +77,112 @@ class InstrumentedAsyncServer:
             # track socket connection times
             self.sio.manager._timestamps = {}
 
-            # report socket.io connections, disconnections and received events
-            self.sio.__trigger_event = self.sio._trigger_event
-            self.sio._trigger_event = self._trigger_event
+            # The following monkey-patches are installed only once per
+            # Socket.IO server, no matter how many instrumented servers
+            # monitor it. The shared patches dispatch to the instrumented
+            # server(s) registered for the server, so that repeated
+            # instrumentation does not stack wrappers.
+            if not hasattr(self.sio, '_socketio_trigger_event'):
+                # report socket.io connections, disconnections and events
+                self.sio._socketio_trigger_event = self.sio._trigger_event
+                self.sio._trigger_event = functools.partial(
+                    InstrumentedAsyncServer._trigger_event, self.sio)
 
-            # report join rooms
-            self.sio.manager.__basic_enter_room = \
-                self.sio.manager.basic_enter_room
-            self.sio.manager.basic_enter_room = self._basic_enter_room
+                # report join rooms
+                self.sio.manager._socketio_basic_enter_room = \
+                    self.sio.manager.basic_enter_room
+                self.sio.manager.basic_enter_room = functools.partial(
+                    InstrumentedAsyncServer._basic_enter_room, self.sio)
 
-            # report leave rooms
-            self.sio.manager.__basic_leave_room = \
-                self.sio.manager.basic_leave_room
-            self.sio.manager.basic_leave_room = self._basic_leave_room
+                # report leave rooms
+                self.sio.manager._socketio_basic_leave_room = \
+                    self.sio.manager.basic_leave_room
+                self.sio.manager.basic_leave_room = functools.partial(
+                    InstrumentedAsyncServer._basic_leave_room, self.sio)
 
-            # report emit events
-            self.sio.manager.__emit = self.sio.manager.emit
-            self.sio.manager.emit = self._emit
+                # report emit events
+                self.sio.manager._socketio_emit = self.sio.manager.emit
+                self.sio.manager.emit = functools.partial(
+                    InstrumentedAsyncServer._emit, self.sio)
 
-        # report engine.io connections
-        self.sio.eio.on('connect', self._handle_eio_connect)
-        self.sio.eio.on('disconnect', self._handle_eio_disconnect)
+        if self.sio.eio not in self._instrumented_eio_servers:
+            # report engine.io connections
+            self.sio.eio.on('connect', functools.partial(
+                InstrumentedAsyncServer._handle_eio_connect, self.sio))
+            self.sio.eio.on('disconnect', functools.partial(
+                InstrumentedAsyncServer._handle_eio_disconnect, self.sio))
 
-        # report polling packets
+            # report polling packets
+            self.sio.eio._socketio_ok = self.sio.eio._ok
+            self.sio.eio._ok = functools.partial(
+                InstrumentedAsyncServer._eio_http_response, self.sio)
+
+        # The Engine.IO socket class is patched only once, no matter how
+        # many servers are instrumented in this process. The shared patches
+        # dispatch to the instrumented server(s) registered for the
+        # Engine.IO server that owns each socket.
         from engineio.async_socket import AsyncSocket
-        self.sio.eio.__ok = self.sio.eio._ok
-        self.sio.eio._ok = self._eio_http_response
-        AsyncSocket.__handle_post_request = AsyncSocket.handle_post_request
-        AsyncSocket.handle_post_request = functools.partialmethod(
-            self.__class__._eio_handle_post_request, self)
-
-        # report websocket packets
-        AsyncSocket.__websocket_handler = AsyncSocket._websocket_handler
-        AsyncSocket._websocket_handler = functools.partialmethod(
-            self.__class__._eio_websocket_handler, self)
-
-        # report connected sockets with each ping
-        if self.mode == 'development':
-            AsyncSocket.__send_ping = AsyncSocket._send_ping
-            AsyncSocket._send_ping = functools.partialmethod(
-                self.__class__._eio_send_ping, self)
+        if not self._instrumented_eio_servers:
+            AsyncSocket._socketio_handle_post_request = \
+                AsyncSocket.handle_post_request
+            AsyncSocket.handle_post_request = \
+                InstrumentedAsyncServer._eio_handle_post_request
+            AsyncSocket._socketio_websocket_handler = \
+                AsyncSocket._websocket_handler
+            AsyncSocket._websocket_handler = \
+                InstrumentedAsyncServer._eio_websocket_handler
+            AsyncSocket._socketio_send_ping = AsyncSocket._send_ping
+            AsyncSocket._send_ping = InstrumentedAsyncServer._eio_send_ping
+        if self.sio.eio not in self._instrumented_eio_servers:
+            self._instrumented_eio_servers[self.sio.eio] = []
+        self._instrumented_eio_servers[self.sio.eio].append(self)
 
     def uninstrument(self):  # pragma: no cover
-        if self.mode == 'development':
-            self.sio._trigger_event = self.sio.__trigger_event
-            self.sio.manager.basic_enter_room = \
-                self.sio.manager.__basic_enter_room
-            self.sio.manager.basic_leave_room = \
-                self.sio.manager.__basic_leave_room
-            self.sio.manager.emit = self.sio.manager.__emit
-        self.sio.eio._ok = self.sio.eio.__ok
+        if not self._instrumented:
+            # uninstrumenting a server that is not instrumented is a no-op
+            return
+        self._instrumented = False
 
-        from engineio.async_socket import AsyncSocket
-        AsyncSocket.handle_post_request = AsyncSocket.__handle_post_request
-        AsyncSocket._websocket_handler = AsyncSocket.__websocket_handler
-        if self.mode == 'development':
-            AsyncSocket._send_ping = AsyncSocket.__send_ping
+        # remove this server from the registry
+        eio = self.sio.eio
+        if eio in self._instrumented_eio_servers and \
+                self in self._instrumented_eio_servers[eio]:
+            self._instrumented_eio_servers[eio].remove(self)
+            if not self._instrumented_eio_servers[eio]:
+                del self._instrumented_eio_servers[eio]
+
+        if eio not in self._instrumented_eio_servers:
+            # this was the last instrumented server monitoring this
+            # Socket.IO server, so the monkey-patches are no longer needed
+            if hasattr(self.sio, '_socketio_trigger_event'):
+                self.sio._trigger_event = self.sio._socketio_trigger_event
+                del self.sio._socketio_trigger_event
+                self.sio.manager.basic_enter_room = \
+                    self.sio.manager._socketio_basic_enter_room
+                del self.sio.manager._socketio_basic_enter_room
+                self.sio.manager.basic_leave_room = \
+                    self.sio.manager._socketio_basic_leave_room
+                del self.sio.manager._socketio_basic_leave_room
+                self.sio.manager.emit = self.sio.manager._socketio_emit
+                del self.sio.manager._socketio_emit
+            if hasattr(eio, '_socketio_ok'):
+                eio._ok = eio._socketio_ok
+                del eio._socketio_ok
+            eio.on('connect', self.sio._handle_eio_connect)
+            eio.on('disconnect', self.sio._handle_eio_disconnect)
+
+        if not self._instrumented_eio_servers:
+            # this was the last instrumented server in the process, so the
+            # original Engine.IO socket methods can be restored
+            from engineio.async_socket import AsyncSocket
+            AsyncSocket.handle_post_request = \
+                AsyncSocket._socketio_handle_post_request
+            AsyncSocket._websocket_handler = \
+                AsyncSocket._socketio_websocket_handler
+            AsyncSocket._send_ping = AsyncSocket._socketio_send_ping
+            del AsyncSocket._socketio_handle_post_request
+            del AsyncSocket._socketio_websocket_handler
+            del AsyncSocket._socketio_send_ping
 
     async def admin_connect(self, sid, environ, client_auth):
         authenticated = True
@@ -183,7 +251,15 @@ class InstrumentedAsyncServer:
             self.stats_task = None
             self.stop_stats_event.clear()
 
-    async def _trigger_event(self, event, namespace, *args):
+    @staticmethod
+    async def _trigger_event(sio, event, namespace, *args):
+        for isvr in InstrumentedAsyncServer._instrumented_eio_servers.get(
+                sio.eio, []):
+            if isvr.mode == 'development':
+                await isvr._report_event(event, namespace, *args)
+        return await sio._socketio_trigger_event(event, namespace, *args)
+
+    async def _report_event(self, event, namespace, *args):
         t = time.time()
         sid = args[0]
         if event == 'connect':
@@ -213,7 +289,6 @@ class InstrumentedAsyncServer:
                 (event, *args[1:]),
                 datetime.fromtimestamp(t, timezone.utc).isoformat(),
             ), namespace=self.admin_namespace)
-        return await self.sio.__trigger_event(event, namespace, *args)
 
     async def _check_for_upgrade(self, eio_sid, sid,
                                  namespace):  # pragma: no cover
@@ -230,49 +305,69 @@ class InstrumentedAsyncServer:
             except KeyError:
                 pass
 
-    def _basic_enter_room(self, sid, namespace, room, eio_sid=None):
-        ret = self.sio.manager.__basic_enter_room(sid, namespace, room,
-                                                  eio_sid)
+    @staticmethod
+    def _basic_enter_room(sio, sid, namespace, room, eio_sid=None):
+        ret = sio.manager._socketio_basic_enter_room(sid, namespace, room,
+                                                     eio_sid)
         if room:
-            self.admin_queue.append(('room_joined', (
-                namespace,
-                room,
-                sid,
-                datetime.now(timezone.utc).isoformat(),
-            )))
+            for isvr in InstrumentedAsyncServer._instrumented_eio_servers \
+                    .get(sio.eio, []):
+                if isvr.mode == 'development':
+                    isvr.admin_queue.append(('room_joined', (
+                        namespace,
+                        room,
+                        sid,
+                        datetime.now(timezone.utc).isoformat(),
+                    )))
         return ret
 
-    def _basic_leave_room(self, sid, namespace, room):
+    @staticmethod
+    def _basic_leave_room(sio, sid, namespace, room):
         if room:
-            self.admin_queue.append(('room_left', (
-                namespace,
-                room,
-                sid,
-                datetime.now(timezone.utc).isoformat(),
-            )))
-        return self.sio.manager.__basic_leave_room(sid, namespace, room)
+            for isvr in InstrumentedAsyncServer._instrumented_eio_servers \
+                    .get(sio.eio, []):
+                if isvr.mode == 'development':
+                    isvr.admin_queue.append(('room_left', (
+                        namespace,
+                        room,
+                        sid,
+                        datetime.now(timezone.utc).isoformat(),
+                    )))
+        return sio.manager._socketio_basic_leave_room(sid, namespace, room)
 
-    async def _emit(self, event, data, namespace, room=None, skip_sid=None,
+    @staticmethod
+    async def _emit(sio, event, data, namespace, room=None, skip_sid=None,
                     callback=None, **kwargs):
-        ret = await self.sio.manager.__emit(
+        ret = await sio.manager._socketio_emit(
             event, data, namespace, room=room, skip_sid=skip_sid,
             callback=callback, **kwargs)
-        if namespace != self.admin_namespace:
+        if not isinstance(skip_sid, list):  # pragma: no branch
+            skip_sid = [skip_sid]
+        for isvr in InstrumentedAsyncServer._instrumented_eio_servers.get(
+                sio.eio, []):
+            if isvr.mode != 'development' or \
+                    namespace == isvr.admin_namespace:
+                continue
             event_data = [event] + list(data) if isinstance(data, tuple) \
                 else [event, data]
-            if not isinstance(skip_sid, list):  # pragma: no branch
-                skip_sid = [skip_sid]
-            for sid, _ in self.sio.manager.get_participants(namespace, room):
+            for sid, _ in isvr.sio.manager.get_participants(namespace, room):
                 if sid not in skip_sid:
-                    await self.sio.emit('event_sent', (
+                    await isvr.sio.emit('event_sent', (
                         namespace,
                         sid,
                         event_data,
                         datetime.now(timezone.utc).isoformat(),
-                    ), namespace=self.admin_namespace)
+                    ), namespace=isvr.admin_namespace)
         return ret
 
-    async def _handle_eio_connect(self, eio_sid, environ):
+    @staticmethod
+    async def _handle_eio_connect(sio, eio_sid, environ):
+        for isvr in InstrumentedAsyncServer._instrumented_eio_servers.get(
+                sio.eio, []):
+            isvr._report_eio_connect(eio_sid, environ)
+        return await sio._handle_eio_connect(eio_sid, environ)
+
+    def _report_eio_connect(self, eio_sid, environ):
         if self.stop_stats_event is None:
             self.stop_stats_event = self.sio.eio.create_event()
         if self.stats_task is None:
@@ -280,57 +375,76 @@ class InstrumentedAsyncServer:
                 self._emit_server_stats)
 
         self.event_buffer.push('rawConnection')
-        return await self.sio._handle_eio_connect(eio_sid, environ)
 
-    async def _handle_eio_disconnect(self, eio_sid, reason):
-        self.event_buffer.push('rawDisconnection')
-        return await self.sio._handle_eio_disconnect(eio_sid, reason)
+    @staticmethod
+    async def _handle_eio_disconnect(sio, eio_sid, reason):
+        for isvr in InstrumentedAsyncServer._instrumented_eio_servers.get(
+                sio.eio, []):
+            isvr.event_buffer.push('rawDisconnection')
+        return await sio._handle_eio_disconnect(eio_sid, reason)
 
-    def _eio_http_response(self, packets=None, headers=None, jsonp_index=None):
-        ret = self.sio.eio.__ok(packets=packets, headers=headers,
-                                jsonp_index=jsonp_index)
-        self.event_buffer.push('packetsOut')
-        self.event_buffer.push('bytesOut', len(ret['response']))
+    @staticmethod
+    def _eio_http_response(sio, packets=None, headers=None, jsonp_index=None):
+        ret = sio.eio._socketio_ok(packets=packets, headers=headers,
+                                   jsonp_index=jsonp_index)
+        for isvr in InstrumentedAsyncServer._instrumented_eio_servers.get(
+                sio.eio, []):
+            isvr.event_buffer.push('packetsOut')
+            isvr.event_buffer.push('bytesOut', len(ret['response']))
         return ret
 
-    async def _eio_handle_post_request(socket, self, environ):
-        ret = await socket.__handle_post_request(environ)
-        self.event_buffer.push('packetsIn')
-        self.event_buffer.push(
-            'bytesIn', int(environ.get('CONTENT_LENGTH', 0)))
+    @staticmethod
+    async def _eio_handle_post_request(socket, environ):
+        ret = await socket._socketio_handle_post_request(environ)
+        for isvr in InstrumentedAsyncServer._instrumented_eio_servers.get(
+                socket.server, []):
+            isvr.event_buffer.push('packetsIn')
+            isvr.event_buffer.push(
+                'bytesIn', int(environ.get('CONTENT_LENGTH', 0)))
         return ret
 
-    async def _eio_websocket_handler(socket, self, ws):
+    @staticmethod
+    async def _eio_websocket_handler(socket, ws):
+        isvrs = InstrumentedAsyncServer._instrumented_eio_servers.get(
+            socket.server, [])
+
         async def _send(ws, data):
-            self.event_buffer.push('packetsOut')
-            self.event_buffer.push('bytesOut', len(data))
-            return await ws.__send(data)
+            for isvr in isvrs:
+                isvr.event_buffer.push('packetsOut')
+                isvr.event_buffer.push('bytesOut', len(data))
+            return await ws._socketio_send(data)
 
         async def _wait(ws):
-            ret = await ws.__wait()
-            self.event_buffer.push('packetsIn')
-            self.event_buffer.push('bytesIn', len(ret or ''))
+            ret = await ws._socketio_wait()
+            for isvr in isvrs:
+                isvr.event_buffer.push('packetsIn')
+                isvr.event_buffer.push('bytesIn', len(ret or ''))
             return ret
 
-        ws.__send = ws.send
+        ws._socketio_send = ws.send
         ws.send = functools.partial(_send, ws)
-        ws.__wait = ws.wait
+        ws._socketio_wait = ws.wait
         ws.wait = functools.partial(_wait, ws)
-        return await socket.__websocket_handler(ws)
+        return await socket._socketio_websocket_handler(ws)
 
-    async def _eio_send_ping(socket, self):  # pragma: no cover
+    @staticmethod
+    async def _eio_send_ping(socket):  # pragma: no cover
         eio_sid = socket.sid
         t = time.time()
-        for namespace in self.sio.manager.get_namespaces():
-            sid = self.sio.manager.sid_from_eio_sid(eio_sid, namespace)
-            if sid:
-                serialized_socket = self.serialize_socket(sid, namespace,
-                                                          eio_sid)
-                await self.sio.emit('socket_connected', (
-                    serialized_socket,
-                    datetime.fromtimestamp(t, timezone.utc).isoformat(),
-                ), namespace=self.admin_namespace)
-        return await socket.__send_ping()
+        for isvr in InstrumentedAsyncServer._instrumented_eio_servers.get(
+                socket.server, []):
+            if isvr.mode != 'development':
+                continue
+            for namespace in isvr.sio.manager.get_namespaces():
+                sid = isvr.sio.manager.sid_from_eio_sid(eio_sid, namespace)
+                if sid:
+                    serialized_socket = isvr.serialize_socket(
+                        sid, namespace, eio_sid)
+                    await isvr.sio.emit('socket_connected', (
+                        serialized_socket,
+                        datetime.fromtimestamp(t, timezone.utc).isoformat(),
+                    ), namespace=isvr.admin_namespace)
+        return await socket._socketio_send_ping()
 
     async def _emit_server_stats(self):
         start_time = time.time()
