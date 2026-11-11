@@ -129,7 +129,8 @@ class AsyncServer(base_server.BaseServer):
         self.eio.attach(app, socketio_path)
 
     async def emit(self, event, data=None, to=None, room=None, skip_sid=None,
-                   namespace=None, callback=None, ignore_queue=False):
+                   namespace=None, callback=None, ignore_queue=False,
+                   ack_id=None):
         """Emit a custom event to one or more connected clients.
 
         :param event: The event name. It can be any string. The event names
@@ -179,7 +180,7 @@ class AsyncServer(base_server.BaseServer):
                          room or 'all', namespace)
         await self.manager.emit(event, data, namespace, room=room,
                                 skip_sid=skip_sid, callback=callback,
-                                ignore_queue=ignore_queue)
+                                ignore_queue=ignore_queue, ack_id=ack_id)
 
     async def send(self, data, to=None, room=None, skip_sid=None,
                    namespace=None, callback=None, ignore_queue=False):
@@ -231,8 +232,8 @@ class AsyncServer(base_server.BaseServer):
         This method issues an emit with a callback and waits for the callback
         to be invoked before returning. If the callback isn't invoked before
         the timeout, then a ``TimeoutError`` exception is raised. If the
-        Socket.IO connection drops during the wait, this method still waits
-        until the specified timeout.
+        Socket.IO connection drops while waiting, a ``DisconnectedError``
+        exception is raised immediately instead of waiting for the timeout.
 
         :param event: The event name. It can be any string. The event names
                       ``'connect'``, ``'message'`` and ``'disconnect'`` are
@@ -270,6 +271,8 @@ class AsyncServer(base_server.BaseServer):
         if not self.async_handlers:
             raise RuntimeError(
                 'Cannot use call() when async_handlers is False.')
+        namespace = namespace or '/'
+        target_sid = to or sid
         callback_event = self.eio.create_event()
         callback_args = []
 
@@ -277,15 +280,32 @@ class AsyncServer(base_server.BaseServer):
             callback_args.append(args)
             callback_event.set()
 
-        await self.emit(event, data=data, room=to or sid, namespace=namespace,
-                        callback=event_callback, ignore_queue=ignore_queue)
+        # the manager owns the registry and removes the entry on disconnect,
+        # at which point the disconnect hook wakes up this waiter
+        ack_id = self.manager._reserve_ack_id(target_sid, namespace)
+        self.manager._attach_ack(target_sid, namespace, ack_id,
+                                 event_callback,
+                                 on_disconnect=callback_event.set)
         try:
-            await asyncio.wait_for(callback_event.wait(), timeout)
-        except asyncio.TimeoutError:
-            raise exceptions.TimeoutError() from None
-        return callback_args[0] if len(callback_args[0]) > 1 \
-            else callback_args[0][0] if len(callback_args[0]) == 1 \
-            else None
+            await self.emit(event, data=data, room=target_sid,
+                            namespace=namespace, callback=event_callback,
+                            ignore_queue=ignore_queue, ack_id=ack_id)
+            try:
+                await asyncio.wait_for(callback_event.wait(), timeout)
+            except asyncio.TimeoutError:
+                # the wait timed out; if an ACK raced the timeout and resolved
+                # the entry first, return its result instead of failing
+                if self.manager._cancel_ack(target_sid, namespace, ack_id):
+                    raise exceptions.TimeoutError() from None
+            else:
+                if not callback_args:
+                    # woken up by the disconnect hook with no acknowledgement
+                    raise exceptions.DisconnectedError()
+        finally:
+            # completion, timeout, cancellation and disconnect all end here,
+            # so no callback entry is ever left behind in the registry
+            self.manager._cancel_ack(target_sid, namespace, ack_id)
+        return self._unpack_ack_args(callback_args[0])
 
     async def enter_room(self, sid, room, namespace=None):
         """Enter a room.
@@ -649,7 +669,7 @@ class AsyncServer(base_server.BaseServer):
         namespace = namespace or '/'
         sid = self.manager.sid_from_eio_sid(eio_sid, namespace)
         self.logger.info('received ack from %s [%s]', sid, namespace)
-        await self.manager.trigger_callback(sid, id, data)
+        await self.manager.trigger_callback(sid, namespace, id, data)
 
     async def _trigger_event(self, event, namespace, *args):
         """Invoke an application event handler."""

@@ -20,7 +20,7 @@ class Manager(base_manager.BaseManager):
         return self.is_connected(sid, namespace)
 
     def emit(self, event, data, namespace, room=None, skip_sid=None,
-             callback=None, to=None, **kwargs):
+             callback=None, to=None, ack_id=None, **kwargs):
         """Emit a message to a single client, a room, or all the clients
         connected to the namespace."""
         room = to or room
@@ -57,10 +57,12 @@ class Manager(base_manager.BaseManager):
             # implemented but not tested or supported
             for sid, eio_sid in self.get_participants(namespace, room):
                 if sid not in skip_sid:  # pragma: no branch
-                    id = self._generate_ack_id(sid, callback)
+                    if ack_id is None:
+                        ack_id = self._reserve_ack_id(sid, namespace)
+                    self._attach_ack(sid, namespace, ack_id, callback)
                     pkt = self.server.packet_class(
                         packet.EVENT, namespace=namespace, data=[event] + data,
-                        id=id)
+                        id=ack_id)
                     self.server._send_packet(eio_sid, pkt)
 
     def disconnect(self, sid, namespace, **kwargs):
@@ -79,15 +81,17 @@ class Manager(base_manager.BaseManager):
         """Remove all participants from a room."""
         return self.basic_close_room(room, namespace)
 
-    def trigger_callback(self, sid, id, data):
-        """Invoke an application callback."""
-        callback = None
-        try:
-            callback = self.callbacks[sid][id]
-        except KeyError:
+    def trigger_callback(self, sid, namespace, id, data):
+        """Invoke an application callback.
+
+        The callback is removed from the registry before it is invoked, so a
+        duplicate or late ACK cannot deliver an old acknowledgement to a call
+        that has already completed, timed out or been disconnected.
+        """
+        namespace = namespace or '/'
+        ack = self._pop_ack(sid, namespace, id)
+        if ack is None:
             # if we get an unknown callback we just ignore it
             self._get_logger().warning('Unknown callback received, ignoring.')
         else:
-            del self.callbacks[sid][id]
-        if callback is not None:
-            callback(*data)
+            ack(*data)

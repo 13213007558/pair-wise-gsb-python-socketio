@@ -1,5 +1,9 @@
 # python-socketio change log
 
+**Unreleased**
+
+- Give `Server.call()` and `AsyncServer.call()` a clear acknowledgement lifecycle: the pending callback is removed on completion, timeout, cancellation or disconnect, so repeated short timeouts no longer leak callback entries. A disconnect while waiting now raises `DisconnectedError` immediately instead of waiting out the full timeout. ACK ids and callbacks are tracked per `(sid, namespace)`, so a late or duplicated ACK can never be delivered to another call, disconnecting from one namespace no longer removes requests waiting on another namespace of the same connection, and a reconnected client cannot consume an old acknowledgement. Plain `emit(callback=...)` behavior is unchanged and does not gain a timeout.
+
 **Release 5.18.1** - 2026-11-03
 
 - Fix enter/leave room in connect handler, when a message queue is used (regression introduced in v5.18.0) [#10008](https://code.miguelgrinberg.com/miguelgrinberg/python-socketio.git/issues/10008) ([commit](https://code.miguelgrinberg.com/miguelgrinberg/python-socketio.git/commit/f12552a405a39f7f47e930830655f05d5e702cbb))

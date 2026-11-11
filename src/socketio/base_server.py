@@ -69,6 +69,17 @@ class BaseServer:
     def is_asyncio_based(self):
         return False
 
+    @staticmethod
+    def _unpack_ack_args(args):
+        """Normalize the arguments of an acknowledgement into the value
+        returned by :meth:`Server.call`: multiple arguments are returned as a
+        tuple, a single argument as-is, and no arguments as ``None``."""
+        if len(args) > 1:
+            return args
+        if len(args) == 1:
+            return args[0]
+        return None
+
     def on(self, event, handler=None, namespace=None):
         """Register an event handler.
 

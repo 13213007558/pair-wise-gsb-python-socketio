@@ -7,6 +7,28 @@ from bidict import bidict, ValueDuplicationError
 default_logger = logging.getLogger('socketio')
 
 
+class Ack:
+    """A registered acknowledgement callback.
+
+    The wrapper keeps the application callback together with an optional
+    ``on_disconnect`` hook. The hook is invoked by the manager when the
+    client leaves the namespace while the acknowledgement is still pending,
+    which allows synchronous request/response calls (see
+    :meth:`Server.call`) to be aborted instead of waiting out their full
+    timeout.
+    """
+    def __init__(self, callback, on_disconnect=None):
+        self.callback = callback
+        self.on_disconnect = on_disconnect
+
+    def __call__(self, *args):
+        return self.callback(*args)
+
+    def disconnected(self):
+        if self.on_disconnect is not None:
+            self.on_disconnect()
+
+
 class BaseManager:
     def __init__(self):
         self.logger = None
@@ -140,8 +162,16 @@ class BaseManager:
                 rooms.append(room_name)
         for room in rooms:
             self.basic_leave_room(sid, namespace, room)
-        if sid in self.callbacks:
-            del self.callbacks[sid]
+        # any acknowledgement that is still waiting on this client for the
+        # disconnected namespace is removed; pending acks registered against
+        # other namespaces of the same sid are left untouched
+        if sid in self.callbacks and namespace in self.callbacks[sid]:
+            pending = self.callbacks[sid].pop(namespace)
+            if not self.callbacks[sid]:
+                del self.callbacks[sid]
+            for ack in pending.values():
+                if isinstance(ack, Ack):
+                    ack.disconnected()
         if namespace in self.pending_connect and \
                 sid in self.pending_connect[namespace]:
             self.pending_connect[namespace].remove(sid)
@@ -199,13 +229,85 @@ class BaseManager:
             pass
         return r
 
-    def _generate_ack_id(self, sid, callback):
-        """Generate a unique identifier for an ACK packet."""
-        if sid not in self.callbacks:
-            self.callbacks[sid] = {0: itertools.count(1)}
-        id = next(self.callbacks[sid][0])
-        self.callbacks[sid][id] = callback
+    def _generate_ack_id(self, sid, namespace, callback, on_disconnect=None):
+        """Generate a unique identifier for an ACK packet.
+
+        Callbacks are tracked per ``(sid, namespace)`` so that ACK ids only
+        have to be unique within a namespace and disconnecting from one
+        namespace never removes callbacks waiting on another namespace of the
+        same connection. The returned object is an :class:`Ack` wrapper.
+        """
+        id = self._reserve_ack_id(sid, namespace)
+        self._attach_ack(sid, namespace, id, callback, on_disconnect)
         return id
+
+    def _reserve_ack_id(self, sid, namespace):
+        """Reserve an ACK id without attaching a callback yet.
+
+        Used by :meth:`Server.call`, which registers the entry before sending
+        the packet so that a disconnect happening during the send can already
+        be observed. The callback is attached later through
+        :meth:`_attach_ack`.
+        """
+        namespace = namespace or '/'
+        if sid not in self.callbacks:
+            self.callbacks[sid] = {}
+        if namespace not in self.callbacks[sid]:
+            self.callbacks[sid][namespace] = {0: itertools.count(1)}
+        return next(self.callbacks[sid][namespace][0])
+
+    def _attach_ack(self, sid, namespace, id, callback, on_disconnect=None):
+        """Store the callback for a previously reserved or new ACK id.
+
+        If an entry already exists for ``id`` (the :meth:`Server.call`
+        pre-registration case), it is reused instead of being overwritten, so
+        the disconnect hook registered by the caller is preserved.
+        """
+        namespace = namespace or '/'
+        registry = self.callbacks.setdefault(sid, {}).setdefault(
+            namespace, {0: itertools.count(1)})
+        if id not in registry:
+            registry[id] = Ack(callback, on_disconnect)
+        return id
+
+    def _pop_ack(self, sid, namespace, id):
+        """Atomically remove and return a pending ack, or ``None`` if it is
+        no longer registered (already acknowledged, timed out or removed by a
+        disconnect)."""
+        namespace = namespace or '/'
+        try:
+            return self.callbacks[sid][namespace].pop(id)
+        except KeyError:
+            return None
+
+    def _cancel_ack(self, sid, namespace, id):
+        """Remove a pending ack without invoking its callback.
+
+        Returns ``True`` if the ack was still registered and removed, and
+        ``False`` if an acknowledgement won the race and resolved it first.
+        """
+        return self._pop_ack(sid, namespace, id) is not None
+
+    def _pending_ack_count(self, sid=None, namespace=None):
+        """Return the number of application callbacks currently registered.
+
+        Introspection helper used to verify that no callback entries survive a
+        completed, timed out, cancelled or disconnected call. The registries
+        are snapshotted before iterating so the count stays consistent even
+        when worker threads mutate them concurrently."""
+        if sid is None:
+            return sum(self._pending_ack_count(registered_sid, namespace)
+                       for registered_sid in list(self.callbacks))
+        registry_by_ns = self.callbacks.get(sid)
+        if registry_by_ns is None:
+            return 0
+        if namespace is not None:
+            registry = registry_by_ns.get(namespace or '/')
+            return len([id for id in registry if id != 0]) \
+                if registry is not None else 0
+        return sum(
+            len([id for id in registry if id != 0])
+            for registry in list(registry_by_ns.values()))
 
     def _get_logger(self):
         """Get the appropriate logger

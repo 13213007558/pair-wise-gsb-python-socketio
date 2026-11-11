@@ -52,7 +52,7 @@ class PubSubManager(Manager):
         self._get_logger().info(self.name + ' backend initialized.')
 
     def emit(self, event, data, namespace=None, room=None, skip_sid=None,
-             callback=None, to=None, **kwargs):
+             callback=None, to=None, ack_id=None, **kwargs):
         """Emit a message to a single client, a room, or all the clients
         connected to the namespace.
 
@@ -65,7 +65,7 @@ class PubSubManager(Manager):
         if kwargs.get('ignore_queue'):
             return super().emit(
                 event, data, namespace=namespace, room=room, skip_sid=skip_sid,
-                callback=callback)
+                callback=callback, ack_id=ack_id)
         namespace = namespace or '/'
         if callback is not None:
             if self.server is None:
@@ -73,7 +73,10 @@ class PubSubManager(Manager):
                                    'context of a server.')
             if room is None:
                 raise ValueError('Cannot use callback without a room set.')
-            id = self._generate_ack_id(room, callback)
+            # a pre-registered ack id (from call()) only applies to the local
+            # send path; messages published on the queue keep their own id
+            id = ack_id if ack_id is not None \
+                else self._generate_ack_id(room, namespace, callback)
             callback = (room, namespace, id)
         else:
             callback = None
@@ -186,17 +189,18 @@ class PubSubManager(Manager):
         if self.host_id == message.get('host_id'):
             try:
                 sid = message['sid']
+                namespace = message['namespace']
                 id = message['id']
                 args = message['args']
             except KeyError:
                 return
-            self.trigger_callback(sid, id, args)
+            self.trigger_callback(sid, namespace, id, args)
 
     def _return_callback(self, host_id, sid, namespace, callback_id, *args):
         # When an event callback is received, the callback is returned back
         # to the sender, which is identified by the host_id
         if host_id == self.host_id:
-            self.trigger_callback(sid, callback_id, args)
+            self.trigger_callback(sid, namespace, callback_id, args)
         else:
             self._publish({'method': 'callback', 'host_id': host_id,
                            'sid': sid, 'namespace': namespace,

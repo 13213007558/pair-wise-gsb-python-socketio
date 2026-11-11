@@ -12,7 +12,7 @@ class AsyncManager(BaseManager):
         return self.is_connected(sid, namespace)
 
     async def emit(self, event, data, namespace, room=None, skip_sid=None,
-                   callback=None, to=None, **kwargs):
+                   callback=None, to=None, ack_id=None, **kwargs):
         """Emit a message to a single client, a room, or all the clients
         connected to the namespace.
 
@@ -54,10 +54,12 @@ class AsyncManager(BaseManager):
             # implemented but not tested or supported
             for sid, eio_sid in self.get_participants(namespace, room):
                 if sid not in skip_sid:  # pragma: no branch
-                    id = self._generate_ack_id(sid, callback)
+                    if ack_id is None:
+                        ack_id = self._reserve_ack_id(sid, namespace)
+                    self._attach_ack(sid, namespace, ack_id, callback)
                     pkt = self.server.packet_class(
                         packet.EVENT, namespace=namespace, data=[event] + data,
-                        id=id)
+                        id=ack_id)
                     tasks.append(asyncio.create_task(
                         self.server._send_packet(eio_sid, pkt)))
         if tasks == []:  # pragma: no cover
@@ -111,23 +113,24 @@ class AsyncManager(BaseManager):
         """
         return self.basic_close_room(room, namespace)
 
-    async def trigger_callback(self, sid, id, data):
+    async def trigger_callback(self, sid, namespace, id, data):
         """Invoke an application callback.
+
+        The callback is removed from the registry before it is invoked, so a
+        duplicate or late ACK cannot deliver an old acknowledgement to a call
+        that has already completed, timed out or been disconnected.
 
         Note: this method is a coroutine.
         """
-        callback = None
-        try:
-            callback = self.callbacks[sid][id]
-        except KeyError:
+        namespace = namespace or '/'
+        ack = self._pop_ack(sid, namespace, id)
+        if ack is None:
             # if we get an unknown callback we just ignore it
             self._get_logger().warning('Unknown callback received, ignoring.')
-        else:
-            del self.callbacks[sid][id]
-        if callback is not None:
-            ret = callback(*data)
-            if inspect.iscoroutine(ret):
-                try:
-                    await ret
-                except asyncio.CancelledError:  # pragma: no cover
-                    pass
+            return
+        ret = ack(*data)
+        if inspect.iscoroutine(ret):
+            try:
+                await ret
+            except asyncio.CancelledError:  # pragma: no cover
+                pass

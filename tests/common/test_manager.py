@@ -126,14 +126,37 @@ class TestBaseManager:
         sid1 = self.bm.connect('123', '/')
         sid2 = self.bm.connect('123', '/foo')
         sid3 = self.bm.connect('456', '/foo')
-        self.bm._generate_ack_id(sid1, 'f')
-        self.bm._generate_ack_id(sid2, 'g')
-        self.bm._generate_ack_id(sid3, 'h')
+        self.bm._generate_ack_id(sid1, '/', 'f')
+        self.bm._generate_ack_id(sid2, '/foo', 'g')
+        self.bm._generate_ack_id(sid3, '/foo', 'h')
         self.bm.disconnect(sid2, '/foo')
         assert sid2 not in self.bm.callbacks
         self.bm.disconnect(sid1, '/')
         assert sid1 not in self.bm.callbacks
         assert sid3 in self.bm.callbacks
+
+    def test_disconnect_keeps_callbacks_on_other_namespace(self):
+        sid = self.bm.connect('123', '/')
+        self.bm.connect('123', '/foo')
+        id_root = self.bm._generate_ack_id(sid, '/', 'f')
+        id_foo = self.bm._generate_ack_id(sid, '/foo', 'g')
+        # disconnecting from /foo must not remove the callback waiting on /
+        self.bm.disconnect(sid, '/foo')
+        assert self.bm._pending_ack_count(sid, '/foo') == 0
+        assert self.bm._pending_ack_count(sid, '/') == 1
+        # the surviving entry is still resolvable
+        assert self.bm._pop_ack(sid, '/', id_root) is not None
+        assert self.bm._pop_ack(sid, '/foo', id_foo) is None
+        assert self.bm._pending_ack_count() == 0
+
+    def test_disconnect_invokes_disconnect_hook(self):
+        sid = self.bm.connect('123', '/')
+        on_disconnect = mock.MagicMock()
+        self.bm._generate_ack_id(sid, '/', 'f',
+                                 on_disconnect=on_disconnect)
+        self.bm.disconnect(sid, '/')
+        on_disconnect.assert_called_once_with()
+        assert self.bm._pending_ack_count() == 0
 
     def test_disconnect_bad_namespace(self):
         self.bm.connect('123', '/')
@@ -149,26 +172,62 @@ class TestBaseManager:
         sid1 = self.bm.connect('123', '/')
         sid2 = self.bm.connect('123', '/foo')
         cb = mock.MagicMock()
-        id1 = self.bm._generate_ack_id(sid1, cb)
-        id2 = self.bm._generate_ack_id(sid2, cb)
-        id3 = self.bm._generate_ack_id(sid1, cb)
-        self.bm.trigger_callback(sid1, id1, ['foo'])
-        self.bm.trigger_callback(sid1, id3, ['bar'])
-        self.bm.trigger_callback(sid2, id2, ['bar', 'baz'])
+        id1 = self.bm._generate_ack_id(sid1, '/', cb)
+        id2 = self.bm._generate_ack_id(sid2, '/foo', cb)
+        id3 = self.bm._generate_ack_id(sid1, '/', cb)
+        self.bm.trigger_callback(sid1, '/', id1, ['foo'])
+        self.bm.trigger_callback(sid1, '/', id3, ['bar'])
+        self.bm.trigger_callback(sid2, '/foo', id2, ['bar', 'baz'])
         assert cb.call_count == 3
         cb.assert_any_call('foo')
         cb.assert_any_call('bar')
         cb.assert_any_call('bar', 'baz')
+        assert self.bm._pending_ack_count() == 0
+
+    def test_trigger_callback_is_namespace_scoped(self):
+        sid = self.bm.connect('123', '/')
+        self.bm.connect('123', '/foo')
+        cb_root = mock.MagicMock()
+        cb_foo = mock.MagicMock()
+        id_root = self.bm._generate_ack_id(sid, '/', cb_root)
+        id_foo = self.bm._generate_ack_id(sid, '/foo', cb_foo)
+        # ids can coincide across namespaces without the acks being confused
+        assert id_root == id_foo == 1
+        self.bm.trigger_callback(sid, '/', id_root, ['root'])
+        self.bm.trigger_callback(sid, '/foo', id_foo, ['foo'])
+        cb_root.assert_called_once_with('root')
+        cb_foo.assert_called_once_with('foo')
+
+    def test_duplicate_callback_is_ignored(self):
+        sid = self.bm.connect('123', '/')
+        cb = mock.MagicMock()
+        id = self.bm._generate_ack_id(sid, '/', cb)
+        self.bm.trigger_callback(sid, '/', id, ['first'])
+        # a late or repeated ACK for the same id must be dropped
+        self.bm.trigger_callback(sid, '/', id, ['second'])
+        assert cb.call_count == 1
+        cb.assert_called_once_with('first')
 
     def test_invalid_callback(self):
         sid = self.bm.connect('123', '/')
         cb = mock.MagicMock()
-        id = self.bm._generate_ack_id(sid, cb)
+        id = self.bm._generate_ack_id(sid, '/', cb)
 
         # these should not raise an exception
-        self.bm.trigger_callback('xxx', id, ['foo'])
-        self.bm.trigger_callback(sid, id + 1, ['foo'])
+        self.bm.trigger_callback('xxx', '/', id, ['foo'])
+        self.bm.trigger_callback(sid, '/', id + 1, ['foo'])
+        self.bm.trigger_callback(sid, '/other', id, ['foo'])
         assert cb.call_count == 0
+
+    def test_cancel_ack(self):
+        sid = self.bm.connect('123', '/')
+        cb = mock.MagicMock()
+        id = self.bm._generate_ack_id(sid, '/', cb)
+        assert self.bm._cancel_ack(sid, '/', id) is True
+        # cancelling twice (e.g. from a timeout racing an ACK) is a no-op
+        assert self.bm._cancel_ack(sid, '/', id) is False
+        assert self.bm._pending_ack_count() == 0
+        cb.assert_not_called()
 
     def test_get_namespaces(self):
         assert list(self.bm.get_namespaces()) == []
@@ -335,12 +394,12 @@ class TestBaseManager:
 
     def test_emit_with_callback(self):
         sid = self.bm.connect('123', '/foo')
-        self.bm._generate_ack_id = mock.MagicMock()
-        self.bm._generate_ack_id.return_value = 11
+        self.bm._reserve_ack_id = mock.MagicMock()
+        self.bm._reserve_ack_id.return_value = 11
         self.bm.emit(
             'my event', {'foo': 'bar'}, namespace='/foo', callback='cb'
         )
-        self.bm._generate_ack_id.assert_called_once_with(sid, 'cb')
+        self.bm._reserve_ack_id.assert_called_once_with(sid, '/foo')
         assert self.bm.server._send_packet.call_count == 1
         assert self.bm.server._send_packet.call_args_list[0][0][0] == '123'
         pkt = self.bm.server._send_packet.call_args_list[0][0][1]

@@ -678,7 +678,7 @@ class TestAsyncPubSubManager:
                     'args': ('one', 2),
                 }
             )
-            trigger.assert_awaited_once_with('sid', 123, ('one', 2))
+            trigger.assert_awaited_once_with('sid', '/', 123, ('one', 2))
 
     async def test_handle_callback_bad_host_id(self):
         with mock.patch.object(

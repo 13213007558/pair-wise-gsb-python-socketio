@@ -94,6 +94,7 @@ class TestServer:
             skip_sid='123',
             callback='cb',
             ignore_queue=False,
+            ack_id=None,
         )
         s.emit(
             'my event',
@@ -112,6 +113,7 @@ class TestServer:
             skip_sid='123',
             callback='cb',
             ignore_queue=True,
+            ack_id=None,
         )
 
     def test_emit_default_namespace(self, eio):
@@ -132,6 +134,7 @@ class TestServer:
             skip_sid='123',
             callback='cb',
             ignore_queue=False,
+            ack_id=None,
         )
         s.emit(
             'my event',
@@ -149,6 +152,7 @@ class TestServer:
             skip_sid='123',
             callback='cb',
             ignore_queue=True,
+            ack_id=None,
         )
 
     def test_send(self, eio):
@@ -165,6 +169,7 @@ class TestServer:
             skip_sid='123',
             callback='cb',
             ignore_queue=False,
+            ack_id=None,
         )
         s.send(
             'foo', room='room',
@@ -181,6 +186,7 @@ class TestServer:
             skip_sid='123',
             callback='cb',
             ignore_queue=True,
+            ack_id=None,
         )
 
     def test_call(self, eio):
@@ -684,7 +690,7 @@ class TestServer:
         )
         s._handle_eio_message('123', b'foo')
         s.manager.trigger_callback.assert_called_once_with(
-            sid, 321, ['my message', 'a', b'foo']
+            sid, '/', 321, ['my message', 'a', b'foo']
         )
 
     def test_handle_event_binary_from_unknown(self, eio):
@@ -772,8 +778,8 @@ class TestServer:
         s._handle_eio_connect('123', 'environ')
         s._handle_eio_message('123', '0')
         cb = mock.MagicMock()
-        id1 = s.manager._generate_ack_id('1', cb)
-        id2 = s.manager._generate_ack_id('1', cb)
+        id1 = s.manager._generate_ack_id('1', '/', cb)
+        id2 = s.manager._generate_ack_id('1', '/', cb)
         s._send_packet('123', packet.Packet(
             packet.EVENT, ['my event', 'foo'], id=id1))
         s._send_packet('123', packet.Packet(
@@ -787,7 +793,7 @@ class TestServer:
         s._handle_eio_connect('123', 'environ')
         s._handle_eio_message('123', '0/foo,')
         cb = mock.MagicMock()
-        id = s.manager._generate_ack_id('1', cb)
+        id = s.manager._generate_ack_id('1', '/foo', cb)
         s._send_packet('123', packet.Packet(
             packet.EVENT, ['my event', 'foo'], namespace='/foo', id=id))
         s._handle_eio_message('123', '3/foo,1["foo",2]')

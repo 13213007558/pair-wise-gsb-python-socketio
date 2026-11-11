@@ -345,6 +345,16 @@ provided by the client::
 
     response = sio.call('my event', {'data': 'foobar'}, to=user_sid)
 
+If the client does not acknowledge the event before the configured timeout,
+a :class:`socketio.exceptions.TimeoutError` is raised. If the client
+disconnects while the call is waiting, a
+:class:`socketio.exceptions.DisconnectedError` is raised immediately instead
+of waiting for the timeout. In every case the internal acknowledgement
+callback is removed once the call completes, times out, is cancelled or the
+client disconnects, so repeated short-lived calls do not accumulate callback
+entries. A late or duplicated acknowledgement for a call that has already
+finished is ignored and can never be delivered to a different call.
+
 A much more primitive acknowledgement solution uses callback functions. The
 :func:`socketio.Server.emit` method has an optional ``callback`` argument that
 can be set to a callable. If this argument is given, the callable will be
