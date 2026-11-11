@@ -47,7 +47,8 @@ class Manager(base_manager.BaseManager):
             eio_pkt = [eio_packet.Packet(eio_packet.MESSAGE, p)
                        for p in encoded_packet]
             for sid, eio_sid in self.get_participants(namespace, room):
-                if sid not in skip_sid:
+                if sid not in skip_sid and \
+                        self.can_deliver(sid, namespace, room):
                     for p in eio_pkt:
                         self.server._send_eio_packet(eio_sid, p)
         else:
@@ -56,7 +57,8 @@ class Manager(base_manager.BaseManager):
             # note that callbacks when addressing a group of people are
             # implemented but not tested or supported
             for sid, eio_sid in self.get_participants(namespace, room):
-                if sid not in skip_sid:  # pragma: no branch
+                if sid not in skip_sid and \
+                        self.can_deliver(sid, namespace, room):  # pragma: no branch
                     id = self._generate_ack_id(sid, callback)
                     pkt = self.server.packet_class(
                         packet.EVENT, namespace=namespace, data=[event] + data,

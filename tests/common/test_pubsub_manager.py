@@ -598,6 +598,45 @@ class TestPubSubManager:
                 callback=None,
             )
 
+    def test_handle_emit_delivery_node_blocks_pending_client(self):
+        # the final delivery node must re-check connection state, so that a
+        # broadcast published by another process cannot reach a client whose
+        # connect handler has not accepted it yet
+        sid_pending = self.pm.pre_connect('123', '/')
+        sid_ok = self.pm.connect('456', '/')
+        self.pm.enter_room(sid_pending, '/', 'tenants')
+        self.pm.enter_room(sid_ok, '/', 'tenants')
+
+        base = {'method': 'emit', 'event': 'tenant-alarm',
+                'data': [{'sev': 'critical'}], 'binary': False,
+                'namespace': '/', 'skip_sid': None, 'callback': None,
+                'host_id': 'remote'}
+        self.pm._handle_emit(dict(base, room=None))
+        self.pm._handle_emit(dict(base, room='tenants'))
+
+        recipients = [
+            call[0][0]
+            for call in self.pm.server._send_eio_packet.call_args_list
+        ]
+        assert recipients == ['456', '456']
+        assert '123' not in recipients
+
+        # a direct handshake to the pending sid room is still delivered
+        self.pm._handle_emit(dict(base, event='handshake',
+                                  data=[{'nonce': 9}], room=sid_pending))
+        assert self.pm.server._send_eio_packet.call_args_list[-1][0][0] \
+            == '123'
+        assert self.pm.server._send_eio_packet.call_args_list[-1][0][1] \
+            .encode() == '42["handshake",{"nonce":9}]'
+
+        # after acceptance the remote broadcast reaches the client
+        self.pm.connect(sid_pending, '/')
+        self.pm._handle_emit(dict(base, room=None))
+        assert self.pm.server._send_eio_packet.call_args_list[-2][0][0] \
+            == '123'
+        assert self.pm.server._send_eio_packet.call_args_list[-1][0][0] \
+            == '456'
+
     def test_handle_emit_with_remote_callback(self):
         with mock.patch.object(manager.Manager, 'emit') as super_emit:
             self.pm._handle_emit(

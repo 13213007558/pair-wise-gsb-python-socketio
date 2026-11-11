@@ -530,6 +530,150 @@ class TestServer:
             '123', '4/foo,{"message":"Connection rejected by server"}')
         assert s.environ == {'123': 'environ'}
 
+    def _start_paused_connect(self, s, eio_sid='123',
+                              data='0{"paused":true}'):
+        import threading
+        gate = threading.Event()
+
+        def connect_handler(sid, environ, auth):
+            if auth and auth.get('paused'):
+                gate.wait(5)
+            return True
+
+        # the engineio server is mocked at class level in this test class, so
+        # restore a real thread factory to exercise the handler pause, and
+        # unique session ids (the default mock sequence repeats per test)
+        def run_thread(target, *args, **kwargs):
+            thread = threading.Thread(target=target, args=args,
+                                      kwargs=kwargs)
+            thread.start()
+            return thread
+
+        s.eio.start_background_task.side_effect = run_thread
+        counter = iter(range(100, 1000))
+        s.eio.generate_id.side_effect = lambda: str(next(counter))
+        s.on('connect', connect_handler)
+        s._handle_eio_connect(eio_sid, 'environ')
+        task = s.start_background_task(
+            s._handle_eio_message, eio_sid, data)
+        task.join(0.2)
+        sid = s.manager.sid_from_eio_sid(eio_sid, '/')
+        assert s.manager.is_pre_connected(sid, '/')
+        return gate, task, sid
+
+    def test_broadcast_blocked_while_connect_pending(self, eio):
+        s = server.Server()
+        gate, task, sid_pending = self._start_paused_connect(s)
+        # an authenticated client in the same namespace
+        s._handle_eio_connect('456', 'environ')
+        s._handle_eio_message('456', '0')
+        sid_ok = s.manager.sid_from_eio_sid('456', '/')
+        s.enter_room(sid_pending, 'tenants')
+        s.enter_room(sid_ok, 'tenants')
+
+        s.eio.send_packet.reset_mock()
+        s.emit('tenant-alarm', {'sev': 'critical'})
+        s.emit('tenant-alarm', {'sev': 'room'}, room='tenants')
+
+        delivered = [
+            call[0][0] for call in s.eio.send_packet.call_args_list
+        ]
+        assert delivered == ['456', '456']
+
+        # the connect handler can still send handshake data to its own sid
+        s.emit('handshake', {'nonce': 7}, to=sid_pending)
+        assert s.eio.send_packet.call_args_list[-1][0][0] == '123'
+        assert s.eio.send_packet.call_args_list[-1][0][1].encode() == \
+            '42["handshake",{"nonce":7}]'
+
+        gate.set()
+        task.join(2)
+        assert s.manager.is_connected(sid_pending, '/')
+
+    def test_broadcast_with_ack_and_binary_blocked_while_pending(self, eio):
+        s = server.Server()
+        gate, task, sid_pending = self._start_paused_connect(s)
+        s._handle_eio_connect('456', 'environ')
+        s._handle_eio_message('456', '0')
+
+        s.eio.send_packet.reset_mock()
+        s.eio.send.reset_mock()
+        s.emit('ping-ack', 'x', callback=lambda *a: None)
+        s.emit('blob', b'\x00\x01\x02')
+
+        packet_recipients = [
+            call[0][0] for call in s.eio.send_packet.call_args_list
+        ]
+        ack_recipients = [call[0][0] for call in s.eio.send.call_args_list]
+        assert '123' not in packet_recipients
+        assert '123' not in ack_recipients
+        assert packet_recipients == ['456', '456']
+        assert ack_recipients == ['456']
+        packets = [
+            call[0][1].encode() for call in s.eio.send_packet.call_args_list
+        ]
+        assert '451-["blob",{"_placeholder":true,"num":0}]' in packets
+        assert b'\x00\x01\x02' in packets
+        assert s.eio.send.call_args_list[0][0][1] == '21["ping-ack","x"]'
+        gate.set()
+        task.join(2)
+
+    def test_rejected_pending_connect_leaves_no_membership(self, eio):
+        import threading
+        s = server.Server()
+        gate = threading.Event()
+
+        def run_thread(target, *args, **kwargs):
+            thread = threading.Thread(target=target, args=args,
+                                      kwargs=kwargs)
+            thread.start()
+            return thread
+
+        s.eio.start_background_task.side_effect = run_thread
+        counter = iter(range(100, 1000))
+        s.eio.generate_id.side_effect = lambda: str(next(counter))
+
+        def reject_handler(sid, env, auth):
+            gate.wait(5)
+            return False
+
+        s.on('connect', reject_handler)
+        s._handle_eio_connect('123', 'environ')
+        task = s.start_background_task(s._handle_eio_message, '123', '0')
+        task.join(0.2)
+        sid = s.manager.sid_from_eio_sid('123', '/')
+        s.enter_room(sid, 'tenants')
+
+        s.eio.send_packet.reset_mock()
+        s.eio.send.reset_mock()
+        s.emit('tenant-alarm', {'sev': 'critical'})
+        assert s.eio.send_packet.call_args_list == []
+        assert s.eio.send.call_args_list == []
+
+        gate.set()
+        task.join(2)
+        assert not s.manager.is_connected(sid, '/')
+        assert not s.manager.is_pre_connected(sid, '/')
+        assert s.manager.rooms == {}
+        assert s.manager.pending_connect == {}
+        assert s.eio.send.call_args_list[0][0] == (
+            '123', '4{"message":"Connection rejected by server"}')
+
+    def test_transport_disconnect_during_pending_connect(self, eio):
+        s = server.Server()
+        disconnect_handler = mock.MagicMock()
+        s.on('disconnect', disconnect_handler)
+        gate, task, sid = self._start_paused_connect(s)
+        s.enter_room(sid, 'tenants')
+        s._handle_eio_disconnect('123', s.reason.CLIENT_DISCONNECT)
+        gate.set()
+        task.join(2)
+        assert s.manager.rooms == {}
+        assert s.manager.pending_connect == {}
+        assert s.manager.cancelled_connect == set()
+        # no disconnect event fires for a connection that was never accepted
+        disconnect_handler.assert_not_called()
+
     def test_handle_disconnect(self, eio):
         s = server.Server()
         s.manager.disconnect = mock.MagicMock()

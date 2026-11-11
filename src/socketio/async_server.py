@@ -37,16 +37,27 @@ class AsyncServer(base_server.BaseServer):
                            executed in separate threads. To run handlers for a
                            client synchronously, set to ``False``. The default
                            is ``True``.
-    :param always_connect: When set to ``False``, new connections are
-                           provisory until the connect handler returns
-                           something other than ``False``, at which point they
-                           are accepted. When set to ``True``, connections are
-                           immediately accepted, and then if the connect
-                           handler returns ``False`` a disconnect is issued.
-                           Set to ``True`` if you need to emit events from the
-                           connect handler and your client is confused when it
-                           receives events before the connection acceptance.
-                           In any other case use the default of ``False``.
+    :param always_connect: When set to ``False`` (the default), new
+                           connections are provisional until the connect
+                           handler returns something other than ``False``. A
+                           provisional connection is registered with a sid and
+                           can be addressed directly by that sid, so the
+                           connect handler may emit handshake information to
+                           it, but it does not receive namespace-wide
+                           broadcasts or messages sent to ordinary rooms until
+                           it is accepted. If the handler rejects the
+                           connection, or the transport disconnects while the
+                           handler is still running, all provisional
+                           memberships are removed. When set to ``True``,
+                           connections are immediately accepted and therefore
+                           receive every broadcast from the start; if the
+                           connect handler then returns ``False`` a disconnect
+                           is issued. Choose ``True`` only if you need to emit
+                           events from the connect handler and your client is
+                           confused when it receives events before the
+                           connection acceptance, and accept that broadcasts
+                           are not withheld during the handler run. In any
+                           other case use the default of ``False``.
     :param namespaces: a list of namespaces that are accepted, in addition to
                        any namespaces for which handlers have been defined. The
                        default is `['/']`, which always accepts connections to
@@ -581,6 +592,14 @@ class AsyncServer(base_server.BaseServer):
             fail_reason = {"message": "Connection refused by server"}
             success = False
 
+        if self.manager.is_connect_cancelled(sid, namespace):
+            # the Engine.IO connection was dropped while the connect handler
+            # was running. The provisional registration has already been
+            # removed by the disconnect handler, so do not re-create it and do
+            # not send any packet to a client that no longer exists
+            self.manager.clear_cancelled_connect(sid, namespace)
+            return
+
         if success is False:
             if self.always_connect:
                 self.manager.pre_disconnect(sid, namespace)
@@ -600,7 +619,14 @@ class AsyncServer(base_server.BaseServer):
         """Handle a client disconnect."""
         namespace = namespace or '/'
         sid = self.manager.sid_from_eio_sid(eio_sid, namespace)
-        if not self.manager.is_connected(sid, namespace):  # pragma: no cover
+        if not self.manager.is_connected(sid, namespace):
+            if self.manager.is_pre_connected(sid, namespace):
+                # the client disconnected while its connect handler was
+                # still pending; it never joined the namespace, so remove
+                # its provisional registration without firing a disconnect
+                if eio_sid in self._binary_packet:  # pragma: no cover
+                    del self._binary_packet[eio_sid]
+                self.manager.cancel_pending_connect(sid, namespace)
             return
         self.manager.pre_disconnect(sid, namespace=namespace)
         if eio_sid in self._binary_packet:

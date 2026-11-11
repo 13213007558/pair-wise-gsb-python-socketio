@@ -1,5 +1,9 @@
 # python-socketio change log
 
+**Unreleased**
+
+- Withhold namespace-wide broadcasts and ordinary room messages from connections whose connect handler has not accepted them yet. Provisional connections keep their sid and can still receive handshake information addressed directly to that sid, and are fully removed when the handler rejects them or the transport disconnects mid-handshake. The state check is enforced at the final delivery node, including when a message queue is used. With ``always_connect=True`` the previous behavior is retained: connections are accepted immediately and receive all broadcasts while the connect handler runs.
+
 **Release 5.18.1** - 2026-11-03
 
 - Fix enter/leave room in connect handler, when a message queue is used (regression introduced in v5.18.0) [#10008](https://code.miguelgrinberg.com/miguelgrinberg/python-socketio.git/issues/10008) ([commit](https://code.miguelgrinberg.com/miguelgrinberg/python-socketio.git/commit/f12552a405a39f7f47e930830655f05d5e702cbb))

@@ -16,6 +16,7 @@ class BaseManager:
         self.callbacks = {}
         self.pending_connect = {}
         self.pending_disconnect = {}
+        self.cancelled_connect = set()
         self.json = json
 
     def set_server(self, server):
@@ -93,6 +94,23 @@ class BaseManager:
             pass
         return False  # pragma: no cover
 
+    def cancel_pending_connect(self, sid, namespace):
+        """Mark a pre-connected client as cancelled.
+
+        This is invoked when the Engine.IO transport disappears while the
+        connect handler is still running. The provisional registration is
+        removed immediately, and the marker ensures that the handler, once it
+        returns, cannot re-register the client.
+        """
+        self.basic_disconnect(sid, namespace)
+        self.cancelled_connect.add((namespace, sid))
+
+    def is_connect_cancelled(self, sid, namespace):
+        return (namespace, sid) in self.cancelled_connect
+
+    def clear_cancelled_connect(self, sid, namespace):
+        self.cancelled_connect.discard((namespace, sid))
+
     def is_connected(self, sid, namespace):
         if (
             namespace in self.pending_connect
@@ -108,6 +126,26 @@ class BaseManager:
         except KeyError:
             pass
         return False
+
+    def can_deliver(self, sid, namespace, room):
+        """Return ``True`` if a message may be delivered to ``sid``.
+
+        Clients that are still waiting for their connect handler to accept
+        them (pre-connected, unauthenticated connections) must not receive
+        namespace-wide broadcasts or messages sent to ordinary rooms. The
+        connect handler is still allowed to send handshake information
+        directly to the client by addressing its own sid room.
+        """
+        if isinstance(room, str) and (
+                room == sid or self.is_sid_room(namespace, room)):
+            # a direct message addressed to the client's own sid room,
+            # used by connect handlers to send handshake information
+            return True
+        if not self.is_connected(sid, namespace):
+            # block namespace broadcasts and ordinary room traffic while the
+            # connection is pending acceptance or being disconnected
+            return False
+        return True
 
     def sid_from_eio_sid(self, eio_sid, namespace):
         try:

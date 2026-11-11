@@ -386,3 +386,70 @@ class TestBaseManager:
         assert self.bm.server._send_eio_packet.call_args_list[1][0][0] == '123'
         pkt = self.bm.server._send_eio_packet.call_args_list[1][0][1]
         assert pkt.encode() == b'my binary data'
+
+    def test_emit_skips_pending_client_in_broadcast(self):
+        sid_pending = self.bm.pre_connect('123', '/')
+        sid_ok = self.bm.connect('456', '/')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/')
+        recipients = [
+            call[0][0]
+            for call in self.bm.server._send_eio_packet.call_args_list
+        ]
+        assert recipients == ['456']
+        assert not self.bm.can_deliver(sid_pending, '/', None)
+        assert self.bm.can_deliver(sid_ok, '/', None)
+
+    def test_emit_skips_pending_client_in_room(self):
+        sid_pending = self.bm.pre_connect('123', '/')
+        sid_ok = self.bm.connect('456', '/')
+        self.bm.enter_room(sid_pending, '/', 'tenants')
+        self.bm.enter_room(sid_ok, '/', 'tenants')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/',
+                     room='tenants')
+        recipients = [
+            call[0][0]
+            for call in self.bm.server._send_eio_packet.call_args_list
+        ]
+        assert recipients == ['456']
+
+    def test_emit_to_pending_sid_room_is_allowed(self):
+        # a connect handler must still be able to send handshake data to the
+        # client that is waiting for its connection to be accepted
+        sid_pending = self.bm.pre_connect('123', '/')
+        self.bm.emit('handshake', {'nonce': 7}, namespace='/',
+                     room=sid_pending)
+        assert self.bm.server._send_eio_packet.call_count == 1
+        assert self.bm.server._send_eio_packet.call_args_list[0][0][0] == '123'
+        pkt = self.bm.server._send_eio_packet.call_args_list[0][0][1]
+        assert pkt.encode() == '42["handshake",{"nonce":7}]'
+
+    def test_emit_with_callback_skips_pending_client(self):
+        sid_pending = self.bm.pre_connect('123', '/')
+        sid_ok = self.bm.connect('456', '/')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/',
+                     callback='cb')
+        recipients = [
+            call[0][0] for call in self.bm.server._send_packet.call_args_list
+        ]
+        assert recipients == ['456']
+
+    def test_emit_binary_skips_pending_client(self):
+        self.bm.pre_connect('123', '/')
+        sid_ok = self.bm.connect('456', '/')
+        self.bm.emit('my event', b'my binary data', namespace='/')
+        recipients = [
+            call[0][0]
+            for call in self.bm.server._send_eio_packet.call_args_list
+        ]
+        assert recipients == ['456', '456']
+
+    def test_cancel_pending_connect(self):
+        sid = self.bm.pre_connect('123', '/foo')
+        self.bm.enter_room(sid, '/foo', 'tenants')
+        assert self.bm.is_pre_connected(sid, '/foo')
+        self.bm.cancel_pending_connect(sid, '/foo')
+        assert self.bm.rooms == {}
+        assert self.bm.pending_connect == {}
+        assert self.bm.is_connect_cancelled(sid, '/foo')
+        self.bm.clear_cancelled_connect(sid, '/foo')
+        assert not self.bm.is_connect_cancelled(sid, '/foo')

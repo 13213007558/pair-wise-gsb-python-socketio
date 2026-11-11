@@ -606,6 +606,46 @@ class TestAsyncPubSubManager:
                 callback=None,
             )
 
+    async def test_handle_emit_delivery_node_blocks_pending_client(self):
+        # the final delivery node must re-check connection state, so that a
+        # broadcast published by another process cannot reach a client whose
+        # connect handler has not accepted it yet
+        sid_pending = await self.pm.pre_connect('123', '/')
+        sid_ok = await self.pm.connect('456', '/')
+        await self.pm.enter_room(sid_pending, '/', 'tenants')
+        await self.pm.enter_room(sid_ok, '/', 'tenants')
+
+        base = {'method': 'emit', 'event': 'tenant-alarm',
+                'data': [{'sev': 'critical'}], 'binary': False,
+                'namespace': '/', 'skip_sid': None, 'callback': None,
+                'host_id': 'remote'}
+        await self.pm._handle_emit(dict(base, room=None))
+        await self.pm._handle_emit(dict(base, room='tenants'))
+
+        recipients = [
+            call[0][0]
+            for call in self.pm.server._send_eio_packet.await_args_list
+        ]
+        assert recipients == ['456', '456']
+        assert '123' not in recipients
+
+        # a direct handshake to the pending sid room is still delivered
+        await self.pm._handle_emit(dict(base, event='handshake',
+                                        data=[{'nonce': 9}],
+                                        room=sid_pending))
+        assert self.pm.server._send_eio_packet.await_args_list[-1][0][0] \
+            == '123'
+        assert self.pm.server._send_eio_packet.await_args_list[-1][0][1] \
+            .encode() == '42["handshake",{"nonce":9}]'
+
+        # after acceptance the remote broadcast reaches the client
+        await self.pm.connect(sid_pending, '/')
+        await self.pm._handle_emit(dict(base, room=None))
+        assert self.pm.server._send_eio_packet.await_args_list[-2][0][0] \
+            == '123'
+        assert self.pm.server._send_eio_packet.await_args_list[-1][0][0] \
+            == '456'
+
     async def test_handle_emit_with_remote_callback(self):
         with mock.patch.object(
             async_manager.AsyncManager, 'emit'
