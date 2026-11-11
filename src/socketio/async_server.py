@@ -696,7 +696,14 @@ class AsyncServer(base_server.BaseServer):
         """Dispatch Engine.IO messages."""
         if eio_sid in self._binary_packet:
             pkt = self._binary_packet[eio_sid]
-            if pkt.add_attachment(data):
+            try:
+                complete = pkt.add_attachment(data)
+            except Exception:
+                # a malformed packet must not leave a partially assembled
+                # binary packet that would swallow the following messages
+                del self._binary_packet[eio_sid]
+                raise
+            if complete:
                 del self._binary_packet[eio_sid]
                 if pkt.packet_type == packet.BINARY_EVENT:
                     await self._handle_event(eio_sid, pkt.namespace, pkt.id,

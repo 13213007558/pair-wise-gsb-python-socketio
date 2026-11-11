@@ -517,7 +517,14 @@ class Client(base_client.BaseClient):
         """Dispatch Engine.IO messages."""
         if self._binary_packet:
             pkt = self._binary_packet
-            if pkt.add_attachment(data):
+            try:
+                complete = pkt.add_attachment(data)
+            except Exception:
+                # a malformed packet must not leave a partially assembled
+                # binary packet that would swallow the following messages
+                self._binary_packet = None
+                raise
+            if complete:
                 self._binary_packet = None
                 if pkt.packet_type == packet.BINARY_EVENT:
                     self._handle_event(pkt.namespace, pkt.id, pkt.data)

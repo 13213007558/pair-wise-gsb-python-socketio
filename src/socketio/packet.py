@@ -119,7 +119,15 @@ class Packet:
             raise ValueError('Unexpected binary attachment')
         self.attachments.append(attachment)
         if self.attachment_count == len(self.attachments):
-            self.data = self.reconstruct_binary(self.data, self.attachments)
+            try:
+                self.data = self.reconstruct_binary(self.data,
+                                                    self.attachments)
+            except Exception:
+                # never leave a partially reconstructed packet behind, as it
+                # would be mistaken for an in-progress binary packet and
+                # consume the next message on this connection
+                self.attachments.pop()
+                raise
             return True
         return False
 
@@ -137,7 +145,16 @@ class Packet:
                     for item in data]
         elif isinstance(data, dict):
             if data.get('_placeholder') and 'num' in data:
-                return attachments[data['num']]
+                index = data['num']
+                # the Socket.IO protocol requires placeholder indices to be
+                # non-negative integers in the range of the declared
+                # attachments; reject anything else (notably negative values,
+                # which Python would silently resolve from the end of the
+                # list, booleans and non-integer types)
+                if isinstance(index, bool) or not isinstance(index, int) or \
+                        index < 0 or index >= len(attachments):
+                    raise ValueError('Invalid binary attachment reference')
+                return attachments[index]
             else:
                 return {key: cls._reconstruct_binary_internal(value,
                                                               attachments)
