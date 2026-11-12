@@ -54,6 +54,16 @@ class Server(base_server.BaseServer):
                        default is `['/']`, which always accepts connections to
                        the default namespace. Set to `'*'` to accept all
                        namespaces.
+    :param safe_emits: When set to ``True``, concurrent emits targeting the
+                       same client connection are serialized so that the
+                       Engine.IO packets of each Socket.IO event (in particular
+                       binary events and their attachments) are always
+                       delivered as a contiguous unit and cannot be
+                       interleaved with another event. Different connections
+                       still emit in parallel, and two broadcasts only block
+                       each other on the connections they share. The default
+                       of ``False`` preserves the original, unsynchronized
+                       behavior for backwards compatibility.
     :param kwargs: Connection parameters for the underlying Engine.IO server.
 
     The Engine.IO configuration supports the following settings:
@@ -158,7 +168,8 @@ class Server(base_server.BaseServer):
         at the same time to the same client, then messages composed of
         multiple packets may end up being sent in an incorrect sequence. Use
         standard concurrency solutions (such as a Lock object) to prevent this
-        situation.
+        situation, or enable the ``safe_emits`` option when creating the
+        server to have the serialization handled automatically.
         """
         namespace = namespace or '/'
         room = to or room
@@ -247,7 +258,8 @@ class Server(base_server.BaseServer):
         at the same time to the same client, then messages composed of
         multiple packets may end up being sent in an incorrect sequence. Use
         standard concurrency solutions (such as a Lock object) to prevent this
-        situation.
+        situation, or enable the ``safe_emits`` option when creating the
+        server to have the serialization handled automatically.
         """
         if to is None and sid is None:
             raise ValueError('Cannot use call() to broadcast.')

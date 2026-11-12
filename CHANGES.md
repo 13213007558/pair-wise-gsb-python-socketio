@@ -1,5 +1,9 @@
 # python-socketio change log
 
+**Unreleased**
+
+- Add an opt-in ``safe_emits`` server option that serializes concurrent emits per Engine.IO connection, keeping the packets of a binary event (header and attachments) contiguous and preventing them from being interleaved with another event
+
 **Release 5.18.1** - 2026-11-03
 
 - Fix enter/leave room in connect handler, when a message queue is used (regression introduced in v5.18.0) [#10008](https://code.miguelgrinberg.com/miguelgrinberg/python-socketio.git/issues/10008) ([commit](https://code.miguelgrinberg.com/miguelgrinberg/python-socketio.git/commit/f12552a405a39f7f47e930830655f05d5e702cbb))

@@ -316,6 +316,31 @@ event, and is set to the ``sid`` value assigned to that client's connection
 with the server. When ``to`` is omitted, the event is broadcasted to all
 connected clients.
 
+Concurrent Emits
+~~~~~~~~~~~~~~~~
+
+A Socket.IO event that carries binary data is transported as several
+Engine.IO messages: an event header followed by one or more binary
+attachments. When two background tasks emit to the same client connection at
+the same time, these messages can be interleaved, causing an attachment to be
+attributed to the wrong event.
+
+To prevent this, create the server with ``safe_emits=True``::
+
+   sio = socketio.AsyncServer(safe_emits=True)
+
+In this mode each Engine.IO connection has its own send lock, so the complete
+set of messages that make up an event are always written back to back.
+Different connections continue to emit in parallel, and two room broadcasts
+only serialize on the connections they share. The option is opt-in and
+defaults to ``False`` to preserve the original, unsynchronized behavior.
+
+When an emitting coroutine is cancelled before it obtains the send lock, no
+data is sent. If the cancellation happens after the event header was already
+enqueued, the server still drains the remaining messages of that event, so the
+client never receives a half message that the next emit would have to
+complete.
+
 Acknowledging Events
 ~~~~~~~~~~~~~~~~~~~~
 

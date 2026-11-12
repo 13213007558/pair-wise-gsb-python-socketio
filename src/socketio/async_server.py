@@ -52,6 +52,16 @@ class AsyncServer(base_server.BaseServer):
                        default is `['/']`, which always accepts connections to
                        the default namespace. Set to `'*'` to accept all
                        namespaces.
+    :param safe_emits: When set to ``True``, concurrent emits targeting the
+                       same client connection are serialized so that the
+                       Engine.IO packets of each Socket.IO event (in particular
+                       binary events and their attachments) are always
+                       delivered as a contiguous unit and cannot be
+                       interleaved with another event. Different connections
+                       still emit in parallel, and two broadcasts only block
+                       each other on the connections they share. The default
+                       of ``False`` preserves the original, unsynchronized
+                       behavior for backwards compatibility.
     :param kwargs: Connection parameters for the underlying Engine.IO server.
 
     The Engine.IO configuration supports the following settings:
@@ -114,12 +124,14 @@ class AsyncServer(base_server.BaseServer):
                             ``engineio_logger`` is ``False``.
     """
     def __init__(self, client_manager=None, logger=False, json=None,
-                 async_handlers=True, namespaces=None, **kwargs):
+                 async_handlers=True, namespaces=None, safe_emits=False,
+                 **kwargs):
         if client_manager is None:
             client_manager = async_manager.AsyncManager()
         super().__init__(client_manager=client_manager, logger=logger,
                          json=json, async_handlers=async_handlers,
-                         namespaces=namespaces, **kwargs)
+                         namespaces=namespaces, safe_emits=safe_emits,
+                         **kwargs)
 
     def is_asyncio_based(self):
         return True
@@ -169,7 +181,9 @@ class AsyncServer(base_server.BaseServer):
         tasks are emitting at the same time to the same client connection, then
         messages composed of multiple packets may end up being sent in an
         incorrect sequence. Use standard concurrency solutions (such as a Lock
-        object) to prevent this situation.
+        object) to prevent this situation, or enable the ``safe_emits``
+        option when creating the server to have the serialization handled
+        automatically.
 
         Note 2: this method is a coroutine.
         """

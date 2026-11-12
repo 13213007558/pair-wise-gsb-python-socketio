@@ -15,7 +15,7 @@ class BaseServer:
 
     def __init__(self, client_manager=None, logger=False, serializer='default',
                  json=None, async_handlers=True, always_connect=False,
-                 namespaces=None, **kwargs):
+                 namespaces=None, safe_emits=False, **kwargs):
         engineio_options = kwargs
         engineio_logger = engineio_options.pop('engineio_logger', None)
         if engineio_logger is not None:
@@ -63,6 +63,10 @@ class BaseServer:
         self.async_handlers = async_handlers
         self.always_connect = always_connect
         self.namespaces = namespaces or ['/']
+        # when enabled, emits are serialized per Engine.IO connection so that
+        # the multiple packets of an event (e.g. binary events and their
+        # attachments) are always sent as a contiguous unit
+        self.safe_emits = safe_emits
 
         self.async_mode = self.eio.async_mode
 

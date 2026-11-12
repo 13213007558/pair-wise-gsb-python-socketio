@@ -17,6 +17,12 @@ class BaseManager:
         self.pending_connect = {}
         self.pending_disconnect = {}
         self.json = json
+        # when safe emits are enabled, this dictionary stores one lock per
+        # Engine.IO connection, keyed by eio_sid. The lock guarantees that the
+        # multiple packets of a Socket.IO event (for example the event packet
+        # and its binary attachments) are written to the connection back to
+        # back, without being interleaved with another event.
+        self._send_locks = {}
 
     def set_server(self, server):
         self.server = server
@@ -119,6 +125,14 @@ class BaseManager:
         if namespace in self.rooms:
             return self.rooms[namespace][None].get(sid)
 
+    def _eio_sid_in_use(self, eio_sid):
+        """Check if an Engine.IO connection still has a connected client on
+        any namespace."""
+        for namespace in self.rooms.values():
+            if eio_sid in namespace[None].inverse:
+                return True
+        return False
+
     def pre_disconnect(self, sid, namespace):
         """Put the client in the to-be-disconnected list.
 
@@ -134,12 +148,16 @@ class BaseManager:
     def basic_disconnect(self, sid, namespace, **kwargs):
         if namespace not in self.rooms:
             return
+        eio_sid = self.rooms[namespace][None].get(sid)
         rooms = []
         for room_name, room in self.rooms[namespace].copy().items():
             if sid in room:
                 rooms.append(room_name)
         for room in rooms:
             self.basic_leave_room(sid, namespace, room)
+        if eio_sid is not None and not self._eio_sid_in_use(eio_sid):
+            # the connection no longer exists, release its safe-emit lock
+            self._send_locks.pop(eio_sid, None)
         if sid in self.callbacks:
             del self.callbacks[sid]
         if namespace in self.pending_connect and \

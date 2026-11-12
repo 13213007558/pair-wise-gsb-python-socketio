@@ -386,3 +386,69 @@ class TestBaseManager:
         assert self.bm.server._send_eio_packet.call_args_list[1][0][0] == '123'
         pkt = self.bm.server._send_eio_packet.call_args_list[1][0][1]
         assert pkt.encode() == b'my binary data'
+
+    def test_safe_emit_binary_keeps_packets_contiguous(self):
+        self.bm.server.safe_emits = True
+        sid = self.bm.connect('123', '/')
+        self.bm.emit('my event', b'my binary data', namespace='/', room=sid)
+        calls = self.bm.server._send_eio_packet.call_args_list
+        assert len(calls) == 2
+        assert calls[0][0][0] == calls[1][0][0] == '123'
+        assert calls[0][0][1].encode().startswith('451-')
+        assert calls[1][0][1].encode() == b'my binary data'
+        # a per-connection lock was created and released
+        assert '123' in self.bm._send_locks
+        lock = self.bm._send_locks['123']
+        assert lock.acquire(blocking=False)
+        lock.release()
+
+    def test_safe_emit_callback_uses_send_packet(self):
+        self.bm.server.safe_emits = True
+        sid = self.bm.connect('123', '/')
+        self.bm.emit('my event', {'foo': 'bar'}, namespace='/', room=sid,
+                     callback=lambda *a: None)
+        self.bm.server._send_packet.assert_called_once()
+        args = self.bm.server._send_packet.call_args[0]
+        assert args[0] == '123'
+        assert args[1].id is not None
+
+    def test_safe_emit_serializes_concurrent_threads(self):
+        import threading
+        self.bm.server.safe_emits = True
+        sid1 = self.bm.connect('123', '/')
+        sid2 = self.bm.connect('456', '/')
+        order = []
+        original = self.bm.server._send_eio_packet
+
+        def tracking_send(eio_sid, pkt):
+            order.append((eio_sid, pkt.encode()))
+            return original(eio_sid, pkt)
+
+        self.bm.server._send_eio_packet = tracking_send
+        threads = [
+            threading.Thread(target=self.bm.emit,
+                             args=('a', b'data-a'),
+                             kwargs={'namespace': '/', 'room': sid1}),
+            threading.Thread(target=self.bm.emit,
+                             args=('b', b'data-b'),
+                             kwargs={'namespace': '/', 'room': sid2}),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        # each connection received its header immediately followed by its own
+        # attachment, regardless of thread interleaving
+        for eio_sid, payload in (('123', b'data-a'), ('456', b'data-b')):
+            stream = [encoded for sid, encoded in order if sid == eio_sid]
+            assert len(stream) == 2
+            assert isinstance(stream[0], str) and stream[0].startswith('451-')
+            assert stream[1] == payload
+
+    def test_safe_emit_lock_removed_on_disconnect(self):
+        self.bm.server.safe_emits = True
+        sid = self.bm.connect('123', '/')
+        self.bm.emit('evt', b'data', namespace='/', room=sid)
+        assert '123' in self.bm._send_locks
+        self.bm.disconnect(sid, '/')
+        assert '123' not in self.bm._send_locks
